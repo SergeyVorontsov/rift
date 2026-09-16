@@ -116,10 +116,16 @@ pub fn handle_window_destroyed(
 pub fn handle_window_minimized(
     state: &mut crate::model::RiftState,
     wid: WindowId,
+    remains_in_active_layout: bool,
 ) -> anyhow::Result<crate::actor::reactor::events::EventOutcome> {
     let server_id = if let Some(window) = state.windows.window_mut(wid) {
         if window.info.is_minimized {
-            return Ok(crate::actor::reactor::events::EventOutcome::no_change());
+            return Ok(if remains_in_active_layout {
+                crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
+                    .with_layout_event(LayoutEvent::WindowRemoved(wid))
+            } else {
+                crate::actor::reactor::events::EventOutcome::no_change()
+            });
         }
         window.info.is_minimized = true;
         window.info.sys_id

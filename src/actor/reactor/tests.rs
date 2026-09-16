@@ -1393,6 +1393,21 @@ fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
 }
 
 #[test]
+fn duplicate_minimize_repairs_stale_active_layout_membership() {
+    let (mut reactor, wid, _wsid, space, _space2, screen) = reactor_with_window_on_space1();
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+    reactor.state.windows.window_mut(wid).unwrap().info.is_minimized = true;
+
+    assert!(has_window_in_layout(&mut reactor, space, screen, wid));
+
+    let outcome = reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
+    assert_eq!(outcome.arrange.passes, 1);
+    reactor.apply_event_outcome(outcome);
+
+    assert!(!has_window_in_layout(&mut reactor, space, screen, wid));
+}
+
+#[test]
 fn cross_display_drag_clears_source_floating_position() {
     let (mut reactor, wid, _wsid, space1, space2, initial_frame, screen2) =
         reactor_with_window_on_space1_two_displays();
@@ -3560,6 +3575,43 @@ fn authoritative_active_window_snapshot_reassigns_missing_window_to_inactive_spa
         Some(active_space),
         "other visible windows on the active space must remain untouched"
     );
+}
+
+#[test]
+fn authoritative_snapshot_repairs_hidden_window_stale_in_active_layout() {
+    let (mut reactor, moved, moved_wsid, active_space, inactive_space, frame) =
+        reactor_with_window_on_space1();
+    let retained = WindowId::new(moved.pid, 2);
+    let retained_wsid = WindowServerId::new(102);
+    let active_workspace = reactor.test_workspace(active_space, 0);
+    reactor.send_layout_event(LayoutEvent::WindowAdded(active_space, moved));
+    reactor.add_test_window(retained, retained_wsid, Some(active_space), frame);
+    assert!(reactor.assign_test_window_to_workspace(
+        active_space,
+        retained,
+        active_workspace,
+    ));
+    reactor.send_layout_event(LayoutEvent::WindowAdded(active_space, retained));
+
+    reactor.state.windows.mark_window_hidden(moved_wsid);
+    reactor.mark_test_window_visible_in_space(retained_wsid, active_space);
+    crate::sys::window_server::set_window_spaces_override(
+        moved_wsid,
+        Some(vec![inactive_space.get()]),
+    );
+
+    reactor.reconcile_authoritative_active_window_snapshot(
+        vec![(retained_wsid, Some(active_space))],
+        false,
+    );
+
+    crate::sys::window_server::set_window_spaces_override(moved_wsid, None);
+
+    assert_eq!(reactor.assigned_space_for_window_id(moved), Some(inactive_space));
+    assert!(reactor.test_workspace_for_window(active_space, moved).is_none());
+    assert!(reactor.test_workspace_for_window(inactive_space, moved).is_some());
+    assert!(!has_window_in_layout(&mut reactor, active_space, frame, moved));
+    assert!(has_window_in_layout(&mut reactor, active_space, frame, retained));
 }
 
 #[test]

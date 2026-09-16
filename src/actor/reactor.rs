@@ -843,10 +843,10 @@ impl Reactor {
 
     fn remove_windows_missing_from_active_space_snapshot(
         &mut self,
-        previously_visible_wsids: Vec<WindowServerId>,
+        candidate_wsids: Vec<WindowServerId>,
         preserve_assignments: bool,
     ) {
-        for wsid in previously_visible_wsids {
+        for wsid in candidate_wsids {
             if self.state.windows.is_window_visible(wsid) {
                 continue;
             }
@@ -906,11 +906,17 @@ impl Reactor {
         preserve_missing_assignments: bool,
     ) {
         let observed_windows = active_windows.clone();
-        let previously_visible_wsids: Vec<_> =
+        let mut removal_candidates: HashSet<_> =
             self.state.windows.iter_visible_window_server_ids().collect();
+        removal_candidates.extend(self.state.windows.iter_windows().filter_map(|(wid, window)| {
+            let wsid = window.info.sys_id?;
+            self.assigned_space_for_window_id(wid)
+                .is_some_and(|space| self.is_space_active(space))
+                .then_some(wsid)
+        }));
         self.refresh_active_space_window_membership(active_windows);
         self.remove_windows_missing_from_active_space_snapshot(
-            previously_visible_wsids,
+            removal_candidates.into_iter().collect(),
             preserve_missing_assignments,
         );
         self.reconcile_windows_in_authoritative_active_snapshot(&observed_windows);
@@ -1539,7 +1545,13 @@ impl Reactor {
                 );
             }
             Event::WindowMinimized(wid) => {
-                return window_workflow::handle_window_minimized(&mut self.state, wid);
+                let remains_in_active_layout =
+                    self.layout_manager.layout_engine.is_window_in_active_layout(wid);
+                return window_workflow::handle_window_minimized(
+                    &mut self.state,
+                    wid,
+                    remains_in_active_layout,
+                );
             }
             Event::WindowDeminiaturized(wid) => {
                 let active_space = self.state.windows.window(wid).and_then(|window| {
@@ -3663,6 +3675,12 @@ impl Reactor {
             LayoutEvent::WindowRemoved(wid)
                 if self.layout_manager.layout_engine.focused_window() == Some(wid)
         );
+        let membership_changed = match &event {
+            LayoutEvent::WindowRemoved(wid) | LayoutEvent::WindowRemovedPreserveFloating(wid) => {
+                self.layout_manager.layout_engine.is_window_in_active_layout(*wid)
+            }
+            _ => false,
+        };
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
@@ -3685,7 +3703,7 @@ impl Reactor {
         if focus_changed && let Some(input_tx) = &self.communication_manager.input_tx {
             _ = input_tx.send(crate::actor::input::Request::HideOnFocus);
         }
-        let geometry_changed = response.changed;
+        let geometry_changed = response.changed || membership_changed;
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, workspace_switch_space);
         if geometry_changed {

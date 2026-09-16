@@ -14,6 +14,7 @@ use crate::sys::window_server::WindowServerId;
 /// and managing the lifecycle of window state in the reactor.
 fn sync_existing_window_state(
     state: &mut crate::model::RiftState,
+    layout: &crate::actor::reactor::managers::LayoutManager,
     wid: WindowId,
     info: &WindowInfo,
     active_space: Option<SpaceId>,
@@ -41,7 +42,11 @@ fn sync_existing_window_state(
     }
 
     let outcome = match (was_minimized, info.is_minimized) {
-        (false, true) => window::handle_window_minimized(state, wid)?,
+        (_, true) => window::handle_window_minimized(
+            state,
+            wid,
+            layout.layout_engine.is_window_in_active_layout(wid),
+        )?,
         (true, false) => {
             window::handle_window_deminiaturized(state, window::WindowDeminiaturizedPayload {
                 window: wid,
@@ -331,7 +336,7 @@ pub(crate) fn process_window_list(
                 current_native_space,
             ));
             if let Ok(existing_outcome) =
-                sync_existing_window_state(state, wid, &info, active_space)
+                sync_existing_window_state(state, layout, wid, &info, active_space)
             {
                 outcome.absorb(existing_outcome);
             }

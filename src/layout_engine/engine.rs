@@ -3322,6 +3322,10 @@ impl LayoutEngine {
         self.virtual_workspace_manager
             .is_window_in_active_workspace(window_store, space, window_id)
     }
+
+    pub(crate) fn is_window_in_active_layout(&self, window_id: WindowId) -> bool {
+        self.space_with_window(window_id).is_some()
+    }
 }
 
 #[cfg(test)]
