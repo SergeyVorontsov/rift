@@ -38,6 +38,7 @@ use tokio::join;
 embed_plist::embed_info_plist!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/Info.plist"));
 
 #[derive(Parser)]
+#[command(name = "rift", version = env!("RIFT_VERSION"))]
 struct Cli {
     /// Only run the window manager on the current space.
     #[arg(long)]
@@ -281,6 +282,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             CGSEventType::Known(KnownCGSEvent::SpaceWindowManagementCapabilitiesChanged),
             CGSEventType::Known(KnownCGSEvent::SpaceWindowDestroyed),
             CGSEventType::Known(KnownCGSEvent::SpaceWindowCreated),
+            CGSEventType::Known(KnownCGSEvent::WindowClosed),
             // Native focus wakeups. Payload identities are racy, so adjacent
             // events are coalesced before re-querying WindowServer key focus.
             CGSEventType::Known(KnownCGSEvent::WindowReordered),

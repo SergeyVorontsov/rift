@@ -114,10 +114,6 @@ impl WmCmd {
     pub fn snake_case_variants() -> &'static [String] { &BUILTIN_WM_CMD_VARIANTS }
 }
 
-impl WmCommand {
-    pub fn builtin_candidates() -> &'static [String] { WmCmd::snake_case_variants() }
-}
-
 pub struct Config {
     pub restore_file: PathBuf,
     pub config: crate::common::config::Config,
@@ -430,14 +426,14 @@ impl WmController {
 
     fn new_app(&mut self, pid: pid_t, info: AppInfo) {
         let Some(running_app) = NSRunningApplication::with_process_id(pid) else {
-            debug!(pid = ?pid, "Failed to resolve NSRunningApplication for new app");
+            debug!(?pid, "Failed to resolve NSRunningApplication for new app");
             return;
         };
 
         if running_app.activationPolicy() != NSApplicationActivationPolicy::Regular
             && info.bundle_id.as_deref() != Some("com.apple.loginwindow")
         {
-            sys::app::ensure_activation_policy_observer(pid, info.clone());
+            sys::app::ensure_activation_policy_observer(pid, running_app.clone(), info.clone());
             debug!(
                 pid = ?pid,
                 bundle = ?info.bundle_id,
@@ -452,7 +448,7 @@ impl WmController {
         }
 
         if !running_app.isFinishedLaunching() {
-            sys::app::ensure_finished_launching_observer(pid, info.clone());
+            sys::app::ensure_finished_launching_observer(pid, running_app.clone(), info.clone());
             debug!(
                 pid = ?pid,
                 bundle = ?info.bundle_id,
@@ -487,18 +483,13 @@ impl WmController {
     }
 
     fn reload_config(&self) {
-        let (response, _fut) = r#continue::continuation();
+        let (response, _result) = std::sync::mpsc::sync_channel(1);
         let msg = config::Event::ApplyConfig {
             cmd: crate::common::config::ConfigCommand::ReloadConfig,
             response,
         };
         if let Err(e) = self.config_tx.try_send(msg) {
             let error_message = e.to_string();
-            let tokio::sync::mpsc::error::SendError((_span, msg)) = e;
-            match msg {
-                config::Event::ApplyConfig { response, .. } => std::mem::forget(response),
-                config::Event::QueryConfig(response) => std::mem::forget(response),
-            }
             error!("Failed to request config reload: {error_message}");
         }
     }
