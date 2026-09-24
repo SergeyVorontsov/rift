@@ -5185,6 +5185,68 @@ fn window_closed_removes_logical_window_without_inventory_refresh() {
 }
 
 #[test]
+fn closing_tiled_window_resizes_surviving_windows() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let closed = WindowId::new(1, 2);
+    let survivors = [WindowId::new(1, 1), WindowId::new(1, 3)];
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
+    let closed_wsid = reactor.test_window_server_id(closed);
+    let before = apps.windows[&survivors[0]].frame;
+
+    reactor.handle_event(Event::WindowClosed(closed_wsid));
+    apps.simulate_until_quiet(&mut reactor);
+
+    let layout = test_layout(&mut reactor, space, screen);
+    assert_eq!(layout.len(), 2);
+    for wid in survivors {
+        let expected = layout.iter().find(|(candidate, _)| *candidate == wid).unwrap().1;
+        assert!(
+            apps.windows[&wid].frame.same_as(expected),
+            "surviving window {wid:?} kept a stale frame after close"
+        );
+    }
+    assert!(!before.same_as(apps.windows[&survivors[0]].frame));
+}
+
+#[test]
+fn native_hide_refreshes_inventory_and_retiles_after_window_is_closed() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let closed = WindowId::new(1, 2);
+    let survivors = [WindowId::new(1, 1), WindowId::new(1, 3)];
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
+    let closed_wsid = reactor.test_window_server_id(closed);
+    let before = apps.windows[&survivors[0]].frame;
+    assert_eq!(test_layout(&mut reactor, space, screen).len(), 3);
+
+    // Some apps order a closed window out without emitting WindowClosed or an AX
+    // destruction notification. An inventory following the native hide is then
+    // the only opportunity to retire its stale layout slot.
+    reactor.handle_event(Event::WindowServerVisibilityChanged(closed_wsid));
+    assert!(apps.requests().iter().any(|request| {
+        matches!(request, Request::RefreshWindowInventory(_))
+    }));
+    crate::sys::window_server::set_window_ordered_in_override(closed_wsid, Some(false));
+    reactor.discover_test_windows(1, vec![], survivors.to_vec());
+    crate::sys::window_server::set_window_ordered_in_override(closed_wsid, None);
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert!(reactor.state.windows.record(closed).is_none());
+    let layout = test_layout(&mut reactor, space, screen);
+    assert_eq!(layout.len(), 2);
+    for wid in survivors {
+        let expected = layout.iter().find(|(candidate, _)| *candidate == wid).unwrap().1;
+        assert!(apps.windows[&wid].frame.same_as(expected));
+    }
+    assert!(!before.same_as(apps.windows[&survivors[0]].frame));
+}
+
+#[test]
 fn app_termination_after_ax_invalidation_removes_logical_windows() {
     let (mut apps, mut reactor) = test_context_with_workspace_count(2);
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));

@@ -255,9 +255,16 @@ impl WindowNotify {
                             SpaceId::new(space_id),
                         ));
                     }
+                    CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
+                    | CGSEventType::Known(KnownCGSEvent::WindowHidden) => {
+                        focus_wake.notify();
+                        if let Some(window_id) = evt.window_id {
+                            events_tx.send(Event::WindowServerVisibilityChanged(
+                                WindowServerId::new(window_id),
+                            ));
+                        }
+                    }
                     CGSEventType::Known(KnownCGSEvent::WindowReordered)
-                    | CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
-                    | CGSEventType::Known(KnownCGSEvent::WindowHidden)
                     | CGSEventType::Known(
                         KnownCGSEvent::WindowManagerSpaceFrontConnectionChanged,
                     )

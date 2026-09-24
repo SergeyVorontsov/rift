@@ -277,6 +277,9 @@ pub enum Event {
     /// this event is only for the sls windowclosed event that provides a wsid
     #[serde(skip)]
     WindowClosed(WindowServerId),
+    /// A native hide/unhide can leave an AX window alive without a minimize or close event.
+    #[serde(skip)]
+    WindowServerVisibilityChanged(WindowServerId),
     /// The AXUIElement became invalid, but that is not proof that its native
     /// WindowServer window was destroyed. This commonly happens before macOS
     /// publishes sleep/session lifecycle notifications.
@@ -1094,6 +1097,7 @@ impl Reactor {
             Event::WindowDeminiaturized(wid) => Some(wid.idx.get()),
             Event::MouseMoved(..) => None,
             Event::WindowClosed(wsid) => Some(wsid.as_u32()),
+            Event::WindowServerVisibilityChanged(wsid) => Some(wsid.as_u32()),
             Event::WindowServerDestroyed(wsid, ..) => Some(wsid.as_u32()),
             Event::WindowServerAppeared(wsid, ..) => Some(wsid.as_u32()),
             _ => None,
@@ -1400,6 +1404,12 @@ impl Reactor {
             }
             Event::WindowInventoryRefreshRequested(pid) => {
                 self.request_window_inventory(pid);
+                return Ok(EventOutcome::default());
+            }
+            Event::WindowServerVisibilityChanged(wsid) => {
+                if let Some(wid) = self.state.windows.tracked_window_id(wsid) {
+                    self.request_window_inventory(wid.pid);
+                }
                 return Ok(EventOutcome::default());
             }
             Event::RaiseTargetsMissing { windows, sequence_id } => {
