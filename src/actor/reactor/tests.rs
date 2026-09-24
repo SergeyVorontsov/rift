@@ -1437,32 +1437,30 @@ fn cross_display_drag_clears_source_floating_position() {
         CGPoint::new(screen2.origin.x + 120.0, initial_frame.origin.y),
         initial_frame.size,
     );
-    reactor.drag_manager.drag_state = DragState::Active {
-        session: DragSession {
+    reactor.drag_manager.actor.begin_native(
+        crate::actor::drag::DragSource {
             window: wid,
+            origin_frame: initial_frame,
             last_frame: moved_frame,
             origin_space: None,
-            settled_space: Some(space2),
-            layout_dirty: true,
+            current_space: Some(space2),
+            tiled: false,
         },
-    };
+        crate::actor::drag::DragScene::default(),
+    );
 
-    let (visible_spaces, visible_space_centers) = reactor.visible_spaces_for_layout(true);
     let outcome = crate::actor::reactor::events::drag::handle_mouse_up(
         &mut reactor.state,
         &mut reactor.layout_manager,
         &mut reactor.drag_manager,
         crate::actor::reactor::events::drag::MouseUpPayload {
-            pending_swap: None,
-            swap_space: Some(space2),
+            button: crate::actor::drag::MouseButton::Left,
             final_space: Some(space2),
-            visible_spaces,
-            visible_space_centers,
         },
     )
     .unwrap();
     assert!(outcome.arrange.passes > 0);
-    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+    assert!(!reactor.drag_manager.actor.is_active());
 
     assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space2));
     assert_eq!(
@@ -1483,7 +1481,7 @@ fn cross_display_drag_clears_source_floating_position() {
 }
 
 #[test]
-fn floating_drag_with_latched_swap_stores_the_release_frame() {
+fn floating_drag_never_latches_a_drop_and_stores_the_release_frame() {
     let (mut reactor, floating_wid, space1, _screen, floating_frame) =
         reactor_with_floating_window();
     let workspace = reactor
@@ -1511,11 +1509,8 @@ fn floating_drag_with_latched_swap_stores_the_release_frame() {
         Requested(false),
         Some(MouseState::Down),
     ));
-    assert!(
-        matches!(reactor.drag_manager.drag_state, DragState::PendingSwap { .. }),
-        "expected the overlap to latch a pending swap; got {:?}",
-        reactor.drag_manager.drag_state
-    );
+    assert!(reactor.drag_manager.actor.is_active());
+    assert!(reactor.drag_manager.actor.target().is_none());
 
     // Keep dragging with the swap still latched, then release.
     let released_frame = CGRect::new(
@@ -1529,13 +1524,11 @@ fn floating_drag_with_latched_swap_stores_the_release_frame() {
         Requested(false),
         Some(MouseState::Down),
     ));
-    assert!(matches!(
-        reactor.drag_manager.drag_state,
-        DragState::PendingSwap { .. }
-    ));
-    reactor.handle_event(Event::MouseUp);
+    assert!(reactor.drag_manager.actor.is_active());
+    assert!(reactor.drag_manager.actor.target().is_none());
+    reactor.handle_event(Event::MouseUp(crate::actor::drag::MouseButton::Left));
 
-    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+    assert!(!reactor.drag_manager.actor.is_active());
     assert!(reactor.layout_manager.layout_engine.is_window_floating(floating_wid));
     let stored = reactor
         .layout_manager
@@ -1546,6 +1539,50 @@ fn floating_drag_with_latched_swap_stores_the_release_frame() {
         stored.same_as(released_frame),
         "mouse-up must store where the window was released, not where the swap latched: {stored:?}"
     );
+}
+
+#[test]
+fn cancelling_tiled_modifier_move_reconciles_layout() {
+    let (mut reactor, wid, _wsid, space, _space2, frame, _) =
+        reactor_with_window_on_space1_two_displays();
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+    let source = crate::actor::drag::DragSource {
+        window: wid,
+        origin_frame: frame,
+        last_frame: frame,
+        origin_space: Some(space),
+        current_space: Some(space),
+        tiled: true,
+    };
+
+    reactor.drag_manager.actor.begin_modifier(
+        source,
+        frame.mid(),
+        crate::common::config::MouseAction::Move,
+        crate::actor::drag::DragScene::default(),
+    );
+    reactor.drag_manager.actor.motion(crate::actor::drag::DragMotion {
+        point: CGPoint::new(frame.mid().x + 30.0, frame.mid().y),
+    });
+    reactor.drag_manager.externally_controlled_window = Some(wid);
+    let move_cancel = reactor.dispatch_workflow(Event::DragCancel).unwrap();
+    assert!(move_cancel.arrange.passes > 0);
+    assert_eq!(reactor.drag_manager.externally_controlled_window, None);
+
+    reactor.drag_manager.actor.begin_modifier(
+        source,
+        frame.mid(),
+        crate::common::config::MouseAction::Move,
+        crate::actor::drag::DragScene::default(),
+    );
+    reactor.drag_manager.actor.motion(crate::actor::drag::DragMotion {
+        point: CGPoint::new(frame.mid().x + 30.0, frame.mid().y),
+    });
+    let mut config = reactor.config.clone();
+    config.settings.drag_drop.enabled = false;
+    let config_cancel = reactor.dispatch_workflow(Event::ConfigUpdated(config)).unwrap();
+    assert!(config_cancel.arrange.passes > 0);
+    assert!(!reactor.drag_manager.actor.is_active());
 }
 
 #[test]
@@ -2217,24 +2254,31 @@ fn mission_control_enter_clears_active_drag_state() {
     reactor.insert_test_window_state(wid, frame, Some(WindowServerId::new(1)), true);
     reactor.ensure_active_drag(wid, &frame);
 
-    assert!(matches!(
-        reactor.drag_manager.drag_state,
-        DragState::Active { .. }
-    ));
+    assert!(reactor.drag_manager.actor.is_active());
+    reactor.drag_manager.sync_motion_gate();
+    assert!(
+        reactor
+            .drag_manager
+            .native_motion_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 
-    let (input_tx, mut input_rx) = actor::channel();
+    let (input_tx, _input_rx) = actor::channel();
     reactor.communication_manager.input_tx = Some(input_tx);
     reactor.handle_event(Event::MissionControlNativeEntered);
-    let drag_updates: Vec<_> = std::iter::from_fn(|| input_rx.try_recv().ok())
-        .filter_map(|(_, request)| match request {
-            crate::actor::input::Request::SetDragActive(active) => Some(active),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(drag_updates, vec![false]);
 
-    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
-    assert!(reactor.drag_manager.skip_layout_for_window.is_none());
+    assert!(!reactor.drag_manager.actor.is_active());
+    assert!(
+        !reactor
+            .drag_manager
+            .native_motion_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(reactor.drag_manager.externally_controlled_window.is_none());
+    assert!(reactor.drag_manager.preview_suppressed);
+
+    reactor.handle_event(Event::MissionControlNativeExited);
+    assert!(!reactor.drag_manager.preview_suppressed);
 }
 
 #[test]
@@ -2699,7 +2743,7 @@ fn wake_restored_activation_does_not_switch_workspace_before_user_input() {
 
     // A real input event ends lifecycle suppression, so normal click/Dock
     // activation semantics continue to work after recovery.
-    reactor.handle_event(Event::MouseUp);
+    reactor.handle_event(Event::MouseUp(crate::actor::drag::MouseButton::Left));
     reactor.handle_event(Event::ApplicationActivated(activated.pid, Quiet::No));
     assert_eq!(
         reactor.layout_manager.layout_engine.active_workspace_idx(space),
@@ -2709,7 +2753,7 @@ fn wake_restored_activation_does_not_switch_workspace_before_user_input() {
 }
 
 #[test]
-fn dock_activation_reveals_window_in_active_scrolling_workspace() {
+fn dock_activation_does_not_reposition_visible_scrolling_window() {
     let (mut apps, mut reactor) = test_context();
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(600., 600.));
     let space = SpaceId::new(1);
@@ -2748,8 +2792,8 @@ fn dock_activation_reveals_window_in_active_scrolling_workspace() {
         Some(activated)
     );
     assert!(
-        !apps.requests().is_empty(),
-        "revealing the activated scrolling window should write the adjusted strip layout"
+        apps.requests().is_empty(),
+        "activating a visible scrolling window should not reposition the strip"
     );
 }
 
@@ -3393,6 +3437,76 @@ fn title_change_non_title_fallback_preserves_manually_moved_workspace() {
     );
 }
 
+#[test]
+fn rediscovering_an_unchanged_inventory_does_not_raise_or_refocus() {
+    let settings = crate::common::config::VirtualWorkspaceSettings {
+        app_rules: vec![crate::common::config::AppWorkspaceRule {
+            app_id: Some("com.testapp1".into()),
+            workspace: Some(WorkspaceSelector::Index(0)),
+            focus: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (mut apps, mut reactor) = (Apps::new(), test_reactor_with_workspace_settings(&settings));
+    reactor.config.virtual_workspaces = settings;
+    let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
+    reactor.communication_manager.raise_manager_tx = raise_manager_tx;
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let focused = WindowId::new(1, 2);
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(2), Some(focused));
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Stack,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    while raise_manager_rx.try_recv().is_ok() {}
+    let _ = apps.requests();
+    let focused_before = reactor.layout_manager.layout_engine.focused_window();
+    let windows_before = reactor.test_active_workspace_windows(space);
+
+    reactor.handle_event(Event::WindowInvalidated(
+        WindowId::new(1, 99),
+        super::WindowInvalidationSource::AxDestroyedNotification,
+    ));
+    let token = apps
+        .requests()
+        .into_iter()
+        .find_map(|request| match request {
+            Request::RefreshWindowInventory(token) => Some(token),
+            _ => None,
+        })
+        .expect("an invalidated element requests an inventory refresh");
+
+    reactor.handle_event(Event::WindowsDiscovered {
+        pid: 1,
+        token,
+        successful: true,
+        new: vec![
+            (WindowId::new(1, 1), make_window(1)),
+            (WindowId::new(1, 2), make_window(2)),
+        ],
+        known_visible: vec![WindowId::new(1, 1), WindowId::new(1, 2)],
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    let mut raises = vec![];
+    while let Ok(event) = raise_manager_rx.try_recv() {
+        raises.push(event);
+    }
+    assert!(
+        raises.is_empty(),
+        "an inventory that changed nothing must not raise or refocus: {raises:?}"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.focused_window(),
+        focused_before
+    );
+    assert_eq!(reactor.test_active_workspace_windows(space), windows_before);
+}
 #[test]
 fn menu_open_state_is_cleared_when_owner_deactivates() {
     let mut reactor = test_reactor();

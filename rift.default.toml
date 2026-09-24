@@ -112,6 +112,9 @@ new_window_placement = "master"
 [settings.layout.scrolling]
 # width of the active column (0..1 of screen width)
 column_width_ratio = 0.7
+# Keep each window's current width when it enters scrolling layout (default: true).
+# Widths outside the min/max column bounds are clamped.
+preserve_window_sizes = true
 # min_column_width_ratio / max_column_width_ratio: clamp bounds used by resize commands
 min_column_width_ratio = 0.3
 max_column_width_ratio = 0.9
@@ -212,14 +215,6 @@ thickness = 20.0
 # spacing between the stack line and window edges (in px)
 spacing = 1.0
 
-# experimental mission control
-[settings.ui.mission_control]
-enabled = false
-# enable fade animation when entering/exiting mission control
-fade_enabled = false
-# native macos mission control fade is about 180ms
-fade_duration_ms = 180.0
-
 # Trackpad gestures
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
@@ -242,14 +237,23 @@ distance_pct = 0.08
 haptics_enabled = true
 haptic_pattern = "level_change"
 
-# Window snapping / drag-swap behavior
-[settings.window_snapping]
-# Fraction threshold (0.0..1.0) specifying how much of the dragged window
-# area must be overlapped by a candidate window in order to trigger a
-# swap while dragging. Typical values are around 0.2–0.4.
-# If you prefer more aggressive swapping, lower the value; increase it
-# to require greater overlap before a swap occurs.
-drag_swap_fraction = 0.3
+# Mouse move and tiled-window drop behavior
+[settings.drag_drop]
+# Disable to leave all mouse gestures entirely to macOS and applications.
+enabled = true
+# Modifier used with action1/action2: cmd | alt | shift | ctrl | fn.
+modifier = "fn"
+# Left-button and right-button actions: move.
+# With the modifier held, the action works from anywhere inside a managed window.
+action1 = "move"
+# Dropping in the center of another tiled window: swap | stack.
+# Dropping near an edge of another tiled window inserts on that side.
+# Dropping near an edge of the dragged window's vacated tile moves it one step, like move_node.
+drop_action = "swap"
+# Edge-zone depth. Must be between 0.10 and 0.45; 0.25 leaves a 50% x 50% center.
+drop_zone_fraction = 0.25
+# Show drop-intent feedback when preview rendering is available.
+preview = true
 
 [virtual_workspaces]
 # Virtual workspaces
