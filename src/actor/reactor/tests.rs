@@ -1365,11 +1365,13 @@ fn unmanageable_window_crossing_spaces_is_not_reinserted_into_layout() {
 fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
     let (mut reactor, wid, _wsid, _space1, _space2, _frame) = reactor_with_window_on_space1();
 
-    reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
+    let minimize = reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
+    reactor.apply_event_outcome(minimize);
     let duplicate_minimize = reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
     assert!(duplicate_minimize.arrange.passes == 0);
 
-    reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
+    let deminimize = reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
+    reactor.apply_event_outcome(deminimize);
     let duplicate_deminimize = reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
     assert!(duplicate_deminimize.arrange.passes == 0);
 
@@ -1405,6 +1407,22 @@ fn duplicate_minimize_repairs_stale_active_layout_membership() {
     reactor.apply_event_outcome(outcome);
 
     assert!(!has_window_in_layout(&mut reactor, space, screen, wid));
+}
+
+#[test]
+fn duplicate_minimize_clears_stale_inactive_workspace_assignment() {
+    let (mut reactor, wid, _wsid, space, _space2, screen) = reactor_with_window_on_space1();
+    let workspace = reactor.test_workspace(space, 0);
+    assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+    reactor.state.windows.window_mut(wid).unwrap().info.is_minimized = true;
+
+    assert_eq!(reactor.test_workspace_for_window(space, wid), Some(workspace));
+    assert!(!has_window_in_layout(&mut reactor, space, screen, wid));
+
+    let outcome = reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
+    reactor.apply_event_outcome(outcome);
+
+    assert_eq!(reactor.test_workspace_for_window(space, wid), None);
 }
 
 #[test]

@@ -101,9 +101,10 @@ pub fn handle_window_minimized(
     wid: WindowId,
     remains_in_active_layout: bool,
 ) -> anyhow::Result<crate::actor::reactor::events::EventOutcome> {
+    let remains_assigned_to_workspace = state.windows.workspace_info_for_window(wid).is_some();
     let server_id = if let Some(window) = state.windows.window_mut(wid) {
         if window.info.is_minimized {
-            return Ok(if remains_in_active_layout {
+            return Ok(if remains_in_active_layout || remains_assigned_to_workspace {
                 crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
                     .with_layout_event(LayoutEvent::WindowRemoved(wid))
             } else {
