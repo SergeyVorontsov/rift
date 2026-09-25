@@ -80,8 +80,10 @@ use main_window::MainWindowTracker;
 use managers::LayoutManager;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 pub use replay::{Record, replay};
+use rift_protocol::DirectionalDistance;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace, warn};
 use transaction_manager::TransactionId;
 
@@ -277,9 +279,8 @@ pub enum Event {
     /// this event is only for the sls windowclosed event that provides a wsid
     #[serde(skip)]
     WindowClosed(WindowServerId),
-    /// A native hide/unhide can leave an AX window alive without a minimize or close event.
     #[serde(skip)]
-    WindowServerVisibilityChanged(WindowServerId),
+    WindowServerHidden(WindowServerId),
     /// The AXUIElement became invalid, but that is not proof that its native
     /// WindowServer window was destroyed. This commonly happens before macOS
     /// publishes sleep/session lifecycle notifications.
@@ -424,6 +425,7 @@ pub struct Reactor {
     refresh_quarantine_manager: managers::RefreshQuarantineManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
     active_spaces: HashSet<SpaceId>,
+    startup_ready: Option<oneshot::Sender<()>>,
     pub animation_tx: Option<AnimationSender>,
     #[cfg(test)]
     event_outcome_phase_trace: Vec<&'static str>,
@@ -441,8 +443,9 @@ impl Reactor {
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
         native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> ReactorHandle {
+    ) -> (ReactorHandle, oneshot::Receiver<()>) {
         let (events_tx, events) = actor::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let events_tx_clone = events_tx.clone();
         let mut reactor = Reactor::new(
             config,
@@ -452,6 +455,7 @@ impl Reactor {
             window_notify,
             one_space,
         );
+        reactor.startup_ready = Some(ready_tx);
         reactor.drag_manager.native_motion_active = native_motion_active;
         reactor.communication_manager.input_tx = Some(input_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
@@ -464,7 +468,7 @@ impl Reactor {
                 Executor::run(Reactor::run(reactor, events, events_tx_clone));
             })
             .unwrap();
-        ReactorHandle::new(events_tx, query_handle)
+        (ReactorHandle::new(events_tx, query_handle), ready_rx)
     }
 
     pub fn new(
@@ -554,6 +558,7 @@ impl Reactor {
                 pending_space_change: None,
             },
             active_spaces: HashSet::default(),
+            startup_ready: None,
             animation_tx: None,
             #[cfg(test)]
             event_outcome_phase_trace: Vec::new(),
@@ -1097,7 +1102,7 @@ impl Reactor {
             Event::WindowDeminiaturized(wid) => Some(wid.idx.get()),
             Event::MouseMoved(..) => None,
             Event::WindowClosed(wsid) => Some(wsid.as_u32()),
-            Event::WindowServerVisibilityChanged(wsid) => Some(wsid.as_u32()),
+            Event::WindowServerHidden(wsid) => Some(wsid.as_u32()),
             Event::WindowServerDestroyed(wsid, ..) => Some(wsid.as_u32()),
             Event::WindowServerAppeared(wsid, ..) => Some(wsid.as_u32()),
             _ => None,
@@ -1217,6 +1222,7 @@ impl Reactor {
     fn handle_event_traced(&mut self, event: Event) { self.handle_event_inner(event) }
 
     fn handle_event_inner(&mut self, event: Event) {
+        let may_make_ready = matches!(&event, Event::SpaceStateChanged(_));
         let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
@@ -1227,6 +1233,16 @@ impl Reactor {
                     outcome = outcome.with_focused_window_broadcast(focused_window);
                 }
                 self.apply_event_outcome(outcome);
+                if may_make_ready
+                    && self.startup_ready.is_some()
+                    && let Some(space) = self.default_query_space()
+                    && self.space_state.screen_by_space(space).is_some()
+                {
+                    self.expose_space_if_known(space);
+                    if let Some(tx) = self.startup_ready.take() {
+                        let _ = tx.send(());
+                    }
+                }
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }
@@ -1406,12 +1422,6 @@ impl Reactor {
                 self.request_window_inventory(pid);
                 return Ok(EventOutcome::default());
             }
-            Event::WindowServerVisibilityChanged(wsid) => {
-                if let Some(wid) = self.state.windows.tracked_window_id(wsid) {
-                    self.request_window_inventory(wid.pid);
-                }
-                return Ok(EventOutcome::default());
-            }
             Event::RaiseTargetsMissing { windows, sequence_id } => {
                 let Some(first) = windows.first() else {
                     return Ok(EventOutcome::default());
@@ -1495,6 +1505,12 @@ impl Reactor {
                 )?;
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
+            }
+            Event::WindowServerHidden(wsid) => {
+                if let Some(wid) = self.state.windows.tracked_window_id(wsid) {
+                    self.request_window_inventory(wid.pid);
+                }
+                return Ok(EventOutcome::default());
             }
             Event::WindowInvalidated(wid, source) => {
                 // AX elements are routinely invalidated while the display/session is
@@ -2476,7 +2492,11 @@ impl Reactor {
         for (response, workspace_switch_space) in outcome.layout_responses {
             self.handle_layout_response(response, workspace_switch_space);
         }
-        if outcome.dispatch_mouse_up {
+        // The input tap captured a modifier drag's button and always reports its real release,
+        // so none is inferred from button state for it.
+        let modifier_drag =
+            self.drag_manager.actor.kind() == Some(crate::actor::drag::DragKind::ModifierMove);
+        if outcome.dispatch_mouse_up && !modifier_drag {
             self.handle_event(Event::MouseUp(crate::actor::drag::MouseButton::Left));
         }
 
@@ -3316,20 +3336,35 @@ impl Reactor {
         let Some(source) = self.drag_manager.actor.source() else {
             return;
         };
-        while let Some(intent) = self.drag_manager.actor.intent() {
-            let preview = self.space_state.screen_by_space(intent.space).and_then(|screen| {
-                self.layout_manager.layout_engine.drop_preview_frame(
-                    intent.space,
-                    source.window,
-                    intent.window,
-                    intent.frame,
-                    intent.action,
-                    screen.frame,
-                    screen.display_uuid_opt(),
-                    &self.config.settings.ui.stack_line,
-                )
-            });
-            if !self.drag_manager.actor.set_preview(intent, preview) {
+        while let Some(mut intent) = self.drag_manager.actor.intent() {
+            if intent.window == source.window
+                && !matches!(intent.action, crate::layout_engine::WindowDropAction::Move(_))
+            {
+                self.drag_manager.actor.set_preview(intent, Some(source.origin_frame));
+                break;
+            }
+            let preview = loop {
+                let preview = self.space_state.screen_by_space(intent.space).and_then(|screen| {
+                    self.layout_manager.layout_engine.drop_preview_frame(
+                        intent.space,
+                        source.window,
+                        intent.window,
+                        intent.frame,
+                        intent.action,
+                        screen.frame,
+                        screen.display_uuid_opt(),
+                        &self.config.settings.ui.stack_line,
+                    )
+                });
+                let Some(result) = preview else { break None };
+                let action =
+                    result.action(intent.action, self.config.settings.drag_drop.drop_action);
+                if action == intent.action {
+                    break Some(result);
+                }
+                intent.action = action;
+            };
+            if !self.drag_manager.actor.set_preview(intent, preview.map(|result| result.frame)) {
                 break;
             }
         }
@@ -3924,6 +3959,7 @@ impl Reactor {
             }
             _ => false,
         };
+        self.prepare_refocus_before_removal(&event);
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
@@ -4529,7 +4565,7 @@ impl Reactor {
                     }
                 }
             } else if let Some(space) = pending_refocus_space.take() {
-                if let Some(wid) = self.last_focused_window_in_space(space) {
+                if let Some(wid) = self.visible_focus_candidate_in_active_workspace(space, None) {
                     focus_window = Some(wid);
                     false
                 } else if !self.is_in_drag() {
@@ -4793,6 +4829,25 @@ impl Reactor {
             .is_some_and(|window_workspace| window_workspace != active_workspace)
     }
 
+    fn prepare_refocus_before_removal(&mut self, event: &LayoutEvent) {
+        let focused = self.layout_manager.layout_engine.focused_window();
+        let removed_focus = match event {
+            LayoutEvent::AppClosed(pid) => focused.filter(|wid| wid.pid == *pid),
+            LayoutEvent::WindowRemoved(wid) if focused == Some(*wid) => focused,
+            _ => None,
+        };
+        if let Some(wid) = removed_focus
+            && let Some(space) = self
+                .layout_manager
+                .layout_engine
+                .space_with_window(wid)
+                .filter(|space| self.is_space_active(*space))
+                .or_else(|| self.workspace_command_space())
+        {
+            self.refocus_manager.refocus_state = RefocusState::Pending(space);
+        }
+    }
+
     fn prepare_refocus_after_layout_event(&mut self, event: &LayoutEvent) {
         match event {
             LayoutEvent::WindowAdded(space, wid) => {
@@ -5028,32 +5083,28 @@ impl Reactor {
             let min = frame.min();
             let max = frame.max();
 
-            let (primary_dist, orth_gap) = match direction {
-                Direction::Left => {
-                    if max.x > origin.x {
-                        continue;
-                    }
-                    (origin.x - max.x, interval_gap(min.y, max.y, origin.y, origin.y))
-                }
-                Direction::Right => {
-                    if min.x < origin.x {
-                        continue;
-                    }
-                    (min.x - origin.x, interval_gap(min.y, max.y, origin.y, origin.y))
-                }
-                Direction::Up => {
-                    // Smaller y means visually "up".
-                    if max.y > origin.y {
-                        continue;
-                    }
-                    (origin.y - max.y, interval_gap(min.x, max.x, origin.x, origin.x))
-                }
-                Direction::Down => {
-                    if min.y < origin.y {
-                        continue;
-                    }
-                    (min.y - origin.y, interval_gap(min.x, max.x, origin.x, origin.x))
-                }
+            let (edge, orth_gap) = match direction {
+                Direction::Left => (
+                    CGPoint::new(max.x, origin.y),
+                    interval_gap(min.y, max.y, origin.y, origin.y),
+                ),
+                Direction::Right => (
+                    CGPoint::new(min.x, origin.y),
+                    interval_gap(min.y, max.y, origin.y, origin.y),
+                ),
+                Direction::Up => (
+                    CGPoint::new(origin.x, max.y),
+                    interval_gap(min.x, max.x, origin.x, origin.x),
+                ),
+                Direction::Down => (
+                    CGPoint::new(origin.x, min.y),
+                    interval_gap(min.x, max.x, origin.x, origin.x),
+                ),
+            };
+            let Some(primary_dist) =
+                (origin.x, origin.y).distance_in_direction((edge.x, edge.y), direction)
+            else {
+                continue;
             };
 
             let should_replace = best.as_ref().map_or(true, |(best_primary, best_orth, _)| {

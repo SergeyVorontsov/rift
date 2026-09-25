@@ -255,22 +255,21 @@ impl WindowNotify {
                             SpaceId::new(space_id),
                         ));
                     }
-                    CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
-                    | CGSEventType::Known(KnownCGSEvent::WindowHidden) => {
-                        focus_wake.notify();
-                        if let Some(window_id) = evt.window_id {
-                            events_tx.send(Event::WindowServerVisibilityChanged(
-                                WindowServerId::new(window_id),
-                            ));
-                        }
-                    }
                     CGSEventType::Known(KnownCGSEvent::WindowReordered)
+                    | CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
                     | CGSEventType::Known(
                         KnownCGSEvent::WindowManagerSpaceFrontConnectionChanged,
                     )
                     | CGSEventType::Known(
                         KnownCGSEvent::WindowManagerGlobalFrontConnectionChanged,
                     ) => focus_wake.notify(),
+                    CGSEventType::Known(KnownCGSEvent::WindowHidden) => {
+                        focus_wake.notify();
+                        if let Some(window_id) = evt.window_id {
+                            events_tx
+                                .send(Event::WindowServerHidden(WindowServerId::new(window_id)));
+                        }
+                    }
                     CGSEventType::Known(KnownCGSEvent::WindowMoved)
                     | CGSEventType::Known(KnownCGSEvent::WindowResized) => {
                         // TODO: suppress move/resize while Mission Control is active
