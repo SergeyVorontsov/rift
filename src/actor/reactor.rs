@@ -384,6 +384,10 @@ pub enum Event {
     #[serde(skip)]
     InstallIpc(crate::ipc::InstallRequest),
 
+    BindingModeChanged {
+        mode: String,
+    },
+
     Command(Command),
 
     #[serde(skip)]
@@ -405,6 +409,7 @@ pub enum WindowInvalidationSource {
 pub struct Reactor {
     pub config: Config,
     pub one_space: bool,
+    pub(crate) binding_mode: String,
     app_manager: managers::AppManager,
     layout_manager: managers::LayoutManager,
     pub(crate) state: RiftState,
@@ -489,6 +494,7 @@ impl Reactor {
         let reactor = Reactor {
             config: config.clone(),
             one_space,
+            binding_mode: "default".into(),
             app_manager: managers::AppManager::new(),
             layout_manager: managers::LayoutManager { layout_engine },
             state: RiftState::default(),
@@ -861,7 +867,9 @@ impl Reactor {
                 self.clear_pending_target_if_confirmed_space(wsid, space);
             }
             self.state.windows.mark_window_visible(wsid);
-            self.state.windows.clear_window_server_observed(wsid);
+            if self.state.windows.tracked_window_id(wsid).is_some() {
+                self.state.windows.clear_window_server_observed(wsid);
+            }
         }
     }
 
@@ -1057,6 +1065,16 @@ impl Reactor {
     }
 
     fn handle_loop_event(&mut self, event: Event) {
+        if let Event::BindingModeChanged { mode } = event {
+            if self.binding_mode != mode {
+                let previous_mode = std::mem::replace(&mut self.binding_mode, mode.clone());
+                let _ = self
+                    .communication_manager
+                    .event_broadcaster
+                    .send(BroadcastEvent::BindingModeChanged { previous_mode, mode });
+            }
+            return;
+        }
         let high_frequency = matches!(&event, Event::DragMotion(..));
         if let Event::Query(req) = event {
             self.handle_query_request(req);
@@ -1368,9 +1386,18 @@ impl Reactor {
                     application_workflow::ApplicationActivatedPayload { pid, quiet },
                 )?;
                 if quiet == Quiet::No {
-                    outcome.absorb(self.handle_app_activation_workspace_switch(pid));
+                    let activation_window = if self.state.windows.has_pending_window_for_pid(pid) {
+                        None
+                    } else {
+                        self.main_window_tracker.app_main_window(pid)
+                    };
+                    outcome.absorb(
+                        self.handle_app_activation_workspace_switch(pid, activation_window),
+                    );
+                    outcome.focused_window = activation_window;
+                } else {
+                    outcome.focused_window = raised_window;
                 }
-                outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
             Event::ApplicationDeactivated(pid) => {
@@ -1495,6 +1522,7 @@ impl Reactor {
             }
             Event::WindowClosed(wsid) => {
                 let Some(wid) = self.state.windows.tracked_window_id(wsid) else {
+                    self.state.windows.mark_window_hidden(wsid);
                     return Ok(EventOutcome::default());
                 };
                 let mut outcome = window_workflow::handle_window_destroyed(
@@ -1509,6 +1537,8 @@ impl Reactor {
             Event::WindowServerHidden(wsid) => {
                 if let Some(wid) = self.state.windows.tracked_window_id(wsid) {
                     self.request_window_inventory(wid.pid);
+                } else {
+                    self.state.windows.mark_window_hidden(wsid);
                 }
                 return Ok(EventOutcome::default());
             }
@@ -2709,13 +2739,13 @@ impl Reactor {
     }
 
     fn update_partial_window_server_info(&mut self, ws_info: Vec<WindowServerInfo>) {
-        // Mark visible windows and remove any corresponding observed WSID markers
-        // for ids we now have server info for.
+        // Keep unknown observed windows pending until AX maps them to WindowIds.
         self.state.windows.set_visible_windows(ws_info.iter().map(|info| info.id));
         for info in ws_info.iter() {
-            // If we've been observing this server id from SLS callbacks, clear it.
-            self.state.windows.clear_window_server_observed(info.id);
             self.state.windows.track_window_server_info(*info);
+            if self.state.windows.tracked_window_id(info.id).is_some() {
+                self.state.windows.clear_window_server_observed(info.id);
+            }
 
             if let Some(wid) = self.state.windows.tracked_window_id(info.id) {
                 if let Some(window) = self.state.windows.window_mut(wid) {
@@ -3245,7 +3275,11 @@ impl Reactor {
             observed_windows,
         );
         outcome.absorb(process_outcome);
+        let new_window_ids: Vec<_> = new_windows.iter().map(|(wid, _)| *wid).collect();
         window_discovery::update_window_states(&mut self.state, new_windows);
+        let has_admitted_windows = new_window_ids
+            .iter()
+            .any(|wid| self.state.windows.window(*wid).is_some_and(WindowState::is_admitted));
 
         let candidate_windows: HashSet<WindowId> = self
             .state
@@ -3271,7 +3305,9 @@ impl Reactor {
             .filter_map(|screen| screen.space)
             .filter(|space| self.is_space_active(*space))
             .collect();
-        let focused_window = self.focused_window_for_discovery(pid);
+        let focused_window = self
+            .focused_window_for_discovery(pid)
+            .filter(|(_, wid)| !has_admitted_windows || new_window_ids.contains(wid));
         outcome.absorb(window_discovery::emit_layout_events(
             &mut self.state,
             &mut self.layout_manager,
@@ -4321,7 +4357,11 @@ impl Reactor {
         }
     }
 
-    fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) -> EventOutcome {
+    fn handle_app_activation_workspace_switch(
+        &mut self,
+        pid: pid_t,
+        activation_window: Option<WindowId>,
+    ) -> EventOutcome {
         if self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input {
             debug!(
                 pid,
@@ -4388,8 +4428,7 @@ impl Reactor {
         // so a missing main window means there is no authoritative switch
         // target. Picking an arbitrary window for the process is especially
         // unsafe for apps whose windows span multiple virtual workspaces.
-        let app_window =
-            self.main_window().filter(|wid| wid.pid == pid && self.window_is_standard(*wid));
+        let app_window = activation_window.filter(|wid| self.window_is_standard(*wid));
 
         let Some(app_window_id) = app_window else {
             return EventOutcome::no_change();
