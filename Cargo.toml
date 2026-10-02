@@ -1,6 +1,6 @@
 [package]
 name = "rift-wm"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 build = "build.rs"
 
@@ -80,6 +80,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 	"NSGraphics",
 	"NSGraphicsContext",
 	"NSImage",
+	"NSImageRep",
 	"NSMenu",
 	"NSMenuItem",
 	"NSOpenPanel",
@@ -125,6 +126,7 @@ objc2-core-text = { version = "0.3.2", default-features = false, features = [
 ]}
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
 	"CGColor",
+	"CGBitmapContext",
 	"CGDirectDisplay",
 	"CGError",
 	"CGEvent",
@@ -135,22 +137,6 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 	"libc",
 	"objc2"
 ]}
-objc2-core-media = { version = "0.3.2", default-features = false, features = [
-	"CMSampleBuffer",
-	"objc2-core-video",
-] }
-objc2-core-video = { version = "0.3.2", default-features = false, features = [
-	"CVBuffer",
-	"CVImageBuffer",
-	"CVPixelBuffer",
-	"CVPixelBufferIOSurface",
-	"objc2-io-surface",
-] }
-objc2-io-surface = { version = "0.3.2", default-features = false, features = [
-	"IOSurfaceRef",
-	"objc2",
-	"objc2-core-foundation",
-] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
 	"NSArray",
 	"NSDictionary",
@@ -162,20 +148,23 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 	"NSNotification",
 	"NSError",
 	"NSProcessInfo",
+	"NSRunLoop",
 	"NSURL",
 	"NSValue"
 ]}
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
 	"SCScreenshotManager",
 	"SCShareableContent",
+	"libc",
 	"SCStream",
 	"block2",
 	"objc2-core-foundation",
 	"objc2-core-graphics",
-	"objc2-core-media",
 ] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
 	"CAAnimation",
+	"CADisplayLink",
+	"CAFrameRateRange",
 	"CABase",
 	"CAEAGLLayer",
 	"CAEDRMetadata",
@@ -219,6 +208,7 @@ embed_plist = "1.2.2"
 rustc-hash = "2.1.1"
 rift-client = { path = "crates/rift-client" }
 rift-protocol = { path = "crates/rift-protocol" }
+multitouch = "0.3.2"
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
