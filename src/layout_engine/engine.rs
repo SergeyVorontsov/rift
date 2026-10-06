@@ -1,10 +1,7 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use rift_protocol::{
-    DirectionalDistance, FloatingWindowSize, FloatingWindowSizePreset, ToggleWindowFloatingOptions,
-};
+use rift_protocol::{FloatingWindowSize, FloatingWindowSizePreset, ToggleWindowFloatingOptions};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -53,6 +50,10 @@ impl DropPreview {
             action
         }
     }
+}
+
+fn interval_gap(a_min: f64, a_max: f64, b_min: f64, b_max: f64) -> f64 {
+    (b_min - a_max).max(a_min - b_max).max(0.0)
 }
 
 fn requested_floating_frame(
@@ -734,10 +735,28 @@ impl LayoutEngine {
         window_store: &WindowStore,
         settings: &crate::common::config::VirtualWorkspaceSettings,
     ) {
+        let previous_modes: HashMap<_, _> = self
+            .workspaces
+            .initialized_spaces()
+            .into_iter()
+            .flat_map(|space| {
+                self.workspaces
+                    .list_workspaces(space)
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, name))| {
+                        (
+                            *id,
+                            self.workspaces.desired_layout_mode_for_workspace(index, name),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         self.app_rules = AppRuleEngine::new(&settings.app_rules);
         self.workspaces.update_settings(settings, &self.layout_settings);
 
-        // Re-apply workspace layout rules to already-existing workspaces on hot reload.
+        // Preserve runtime layout choices unless the workspace's configured mode changed.
         let spaces = self.workspaces.initialized_spaces();
         for space in spaces {
             let workspaces = self.workspaces.list_workspaces(space).to_vec();
@@ -748,7 +767,9 @@ impl LayoutEngine {
                     .workspace_info(space, *workspace_id)
                     .map(|ws| ws.layout_mode())
                     .unwrap_or_default();
-                if current_mode != desired_mode {
+                if previous_modes.get(workspace_id).is_some_and(|mode| *mode != desired_mode)
+                    && current_mode != desired_mode
+                {
                     let _ = self.switch_workspace_layout_mode(
                         window_store,
                         space,
@@ -967,7 +988,7 @@ impl LayoutEngine {
         window_store: &mut WindowStore,
         space: SpaceId,
         visible_spaces: &[SpaceId],
-        visible_space_centers: &HashMap<SpaceId, CGPoint>,
+        visible_space_frames: &HashMap<SpaceId, CGRect>,
         direction: Direction,
         is_floating: bool,
     ) -> EventResponse {
@@ -1101,7 +1122,7 @@ impl LayoutEngine {
                 space,
                 direction,
                 visible_spaces,
-                visible_space_centers,
+                visible_space_frames,
             ) {
                 let Some((new_ws_id, new_layout)) =
                     self.workspaces.active_layout_for_space(new_space)
@@ -1190,42 +1211,66 @@ impl LayoutEngine {
         current_space: SpaceId,
         direction: Direction,
         visible_spaces: &[SpaceId],
-        space_centers: &HashMap<SpaceId, CGPoint>,
+        space_frames: &HashMap<SpaceId, CGRect>,
     ) -> Option<SpaceId> {
-        if visible_spaces.len() <= 1 {
-            return None;
-        }
-
-        let current_center = space_centers.get(&current_space)?;
-        let mut candidates = Vec::new();
-        for &candidate_space in visible_spaces {
-            if candidate_space == current_space {
+        let current = *space_frames.get(&current_space)?;
+        let mut best: Option<(f64, f64, SpaceId)> = None;
+        for &space in visible_spaces {
+            if space == current_space {
                 continue;
             }
-            if let Some(candidate_center) = space_centers.get(&candidate_space) {
-                if let Some(delta) = (current_center.x, current_center.y)
-                    .distance_in_direction((candidate_center.x, candidate_center.y), direction)
-                    .filter(|distance| *distance > 0.0)
-                {
-                    candidates.push((candidate_space, delta));
-                }
+            let Some(candidate) = space_frames.get(&space) else {
+                continue;
+            };
+            let (primary_gap, orth_gap) = match direction {
+                Direction::Left => (
+                    current.min().x - candidate.max().x,
+                    interval_gap(
+                        current.min().y,
+                        current.max().y,
+                        candidate.min().y,
+                        candidate.max().y,
+                    ),
+                ),
+                Direction::Right => (
+                    candidate.min().x - current.max().x,
+                    interval_gap(
+                        current.min().y,
+                        current.max().y,
+                        candidate.min().y,
+                        candidate.max().y,
+                    ),
+                ),
+                Direction::Up => (
+                    current.min().y - candidate.max().y,
+                    interval_gap(
+                        current.min().x,
+                        current.max().x,
+                        candidate.min().x,
+                        candidate.max().x,
+                    ),
+                ),
+                Direction::Down => (
+                    candidate.min().y - current.max().y,
+                    interval_gap(
+                        current.min().x,
+                        current.max().x,
+                        candidate.min().x,
+                        candidate.max().x,
+                    ),
+                ),
+            };
+            if primary_gap < 0.0 {
+                continue;
+            }
+            // Prefer aligned displays, then the nearest edge in the requested direction.
+            if best.as_ref().is_none_or(|&(orth, primary, _)| {
+                orth_gap < orth || (orth_gap == orth && primary_gap < primary)
+            }) {
+                best = Some((orth_gap, primary_gap, space));
             }
         }
-
-        if !candidates.is_empty() {
-            candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-            return Some(candidates[0].0);
-        }
-
-        match direction {
-            Direction::Left => {
-                visible_spaces.iter().rev().copied().find(|&space| space != current_space)
-            }
-            Direction::Right => {
-                visible_spaces.iter().copied().find(|&space| space != current_space)
-            }
-            Direction::Up | Direction::Down => None,
-        }
+        best.map(|(_, _, space)| space)
     }
 
     fn remove_window_internal(
@@ -1861,9 +1906,11 @@ impl LayoutEngine {
                     let _ = self.workspaces[ws_id].layout_system.select_window(layout, wid);
                     self.workspaces.set_last_focused_window(space, ws_id, Some(wid));
                     return EventResponse {
-                        changed: self.active_layout_mode_at(space) == LayoutMode::Scrolling
-                            || (selection_changed
-                                && self.active_layout_mode_at(space) == LayoutMode::Floating),
+                        changed: selection_changed
+                            && matches!(
+                                self.active_layout_mode_at(space),
+                                LayoutMode::Scrolling | LayoutMode::Floating
+                            ),
                         ..EventResponse::default()
                     };
                 } else {
@@ -1914,7 +1961,7 @@ impl LayoutEngine {
         window_store: &mut WindowStore,
         space: Option<SpaceId>,
         visible_spaces: &[SpaceId],
-        visible_space_centers: &HashMap<SpaceId, CGPoint>,
+        visible_space_frames: &HashMap<SpaceId, CGRect>,
         command: LayoutCommand,
     ) -> EventResponse {
         if !matches!(command, LayoutCommand::ScrollStrip { .. }) {
@@ -1985,7 +2032,7 @@ impl LayoutEngine {
                         self.workspaces[ws_id].layout_system.remove_window(wid);
                         if options != ToggleWindowFloatingOptions::default()
                             && let (Some(center), Some(size), Some(current)) = (
-                                visible_space_centers.get(&space),
+                                visible_space_frames.get(&space).map(|frame| frame.mid()),
                                 self.workspaces[ws_id].layout_state.active_size(),
                                 window_store.window(wid).map(|window| window.frame_monotonic),
                             )
@@ -2181,7 +2228,7 @@ impl LayoutEngine {
                     window_store,
                     space,
                     visible_spaces,
-                    visible_space_centers,
+                    visible_space_frames,
                     direction,
                     is_floating,
                 );
@@ -2199,13 +2246,23 @@ impl LayoutEngine {
             }
             LayoutCommand::MoveNode(direction) => {
                 self.workspaces[workspace_id].layout_state.last_saved = Some(layout);
-                if !self.workspaces[workspace_id].layout_system.move_selection(layout, direction) {
-                    if let Some(new_space) = self.next_space_for_direction(
+                let adjacent_space = self
+                    .next_space_for_direction(
                         space,
                         direction,
                         visible_spaces,
-                        visible_space_centers,
-                    ) {
+                        visible_space_frames,
+                    )
+                    .filter(|&space| self.workspaces.active_layout_for_space(space).is_some());
+                if !self.workspaces[workspace_id]
+                    .layout_system
+                    .move_selection_with_display_neighbor(
+                        layout,
+                        direction,
+                        adjacent_space.is_some(),
+                    )
+                {
+                    if let Some(new_space) = adjacent_space {
                         let Some((new_ws_id, new_layout)) =
                             self.workspaces.active_layout_for_space(new_space)
                         else {
@@ -2215,9 +2272,18 @@ impl LayoutEngine {
                             );
                             return EventResponse::default();
                         };
-                        let windows = self.workspaces[workspace_id]
+                        let mut windows = self.workspaces[workspace_id]
                             .layout_system
                             .visible_windows_under_selection(layout);
+                        // Prepending each member must preserve the selected subtree's order.
+                        if matches!(direction, Direction::Right | Direction::Down)
+                            && matches!(
+                                self.workspaces[new_ws_id].layout_system,
+                                LayoutSystemKind::Traditional(_)
+                            )
+                        {
+                            windows.reverse();
+                        }
                         for wid in windows {
                             self.workspaces[workspace_id].layout_system.remove_window(wid);
                             if matches!(
@@ -2229,7 +2295,7 @@ impl LayoutEngine {
                             }
                             self.workspaces[new_ws_id]
                                 .layout_system
-                                .add_window_after_selection(new_layout, wid);
+                                .add_window_from_direction(new_layout, wid, direction);
                             self.workspaces.assign_window_to_workspace(
                                 window_store,
                                 new_space,
@@ -3623,23 +3689,148 @@ mod tests {
         );
     }
 
-    fn build_three_spaces() -> (
-        Vec<SpaceId>,
-        HashMap<SpaceId, CGPoint>,
-        SpaceId,
-        SpaceId,
-        SpaceId,
-    ) {
+    fn test_display_frame(center: CGPoint) -> CGRect {
+        CGRect::new(
+            CGPoint::new(center.x - 500.0, center.y - 500.0),
+            CGSize::new(1000.0, 1000.0),
+        )
+    }
+
+    fn build_three_spaces() -> (Vec<SpaceId>, HashMap<SpaceId, CGRect>, SpaceId, SpaceId, SpaceId) {
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
         let middle = SpaceId::new(3);
 
         let mut centers = HashMap::default();
-        centers.insert(left, CGPoint::new(0.0, 0.0));
-        centers.insert(right, CGPoint::new(4000.0, 0.0));
-        centers.insert(middle, CGPoint::new(2000.0, 0.0));
+        centers.insert(left, test_display_frame(CGPoint::new(0.0, 0.0)));
+        centers.insert(right, test_display_frame(CGPoint::new(4000.0, 0.0)));
+        centers.insert(middle, test_display_frame(CGPoint::new(2000.0, 0.0)));
 
         (vec![left, right, middle], centers, left, middle, right)
+    }
+
+    #[test]
+    fn move_node_crosses_display_edge_and_enters_at_near_edge() {
+        use crate::layout_engine::LayoutKind;
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            for stacked in [false, true] {
+                let mut engine = test_engine();
+                let mut store = WindowStore::default();
+                let source = SpaceId::new(1);
+                let target = SpaceId::new(2);
+                let size = CGSize::new(1000.0, 1000.0);
+                let moving = WindowId::new(1, 2);
+                for (space, ids) in [(source, vec![1, 2]), (target, vec![3, 4, 5])] {
+                    let _ = engine.handle_event(&mut store, LayoutEvent::SpaceExposed(space, size));
+                    let _ = engine.handle_event(
+                        &mut store,
+                        LayoutEvent::windows_observed(
+                            space,
+                            1,
+                            ids.into_iter()
+                                .map(|idx| window_layout_info(WindowId::new(1, idx), size))
+                                .collect(),
+                            None,
+                        ),
+                    );
+                    let (ws, layout) = engine.workspaces.active_layout_for_space(space).unwrap();
+                    let LayoutSystemKind::Traditional(system) =
+                        &mut engine.workspaces[ws].layout_system
+                    else {
+                        panic!("expected traditional layout");
+                    };
+                    let root = system.root(layout);
+                    let kind = if stacked {
+                        LayoutKind::VerticalStack
+                    } else {
+                        LayoutKind::from(direction.orientation())
+                    };
+                    system.set_layout(root, kind);
+                    // Select the far side on the destination, so selection-based insertion is wrong.
+                    let selected = if space == source {
+                        moving
+                    } else {
+                        WindowId::new(1, 5)
+                    };
+                    system.select_window(layout, selected);
+                    if space == source
+                        && (direction == Direction::Up
+                            || (direction == Direction::Left && !stacked))
+                    {
+                        system.select_window(layout, WindowId::new(1, 1));
+                    }
+                }
+                let moving =
+                    if direction == Direction::Up || (direction == Direction::Left && !stacked) {
+                        WindowId::new(1, 1)
+                    } else {
+                        moving
+                    };
+                let _ = engine.handle_event(&mut store, LayoutEvent::WindowFocused(source, moving));
+                let offset = match direction {
+                    Direction::Left => CGPoint::new(-1000.0, 0.0),
+                    Direction::Right => CGPoint::new(1000.0, 0.0),
+                    Direction::Up => CGPoint::new(0.0, -1000.0),
+                    Direction::Down => CGPoint::new(0.0, 1000.0),
+                };
+                let centers = HashMap::from_iter([
+                    (source, test_display_frame(CGPoint::new(0.0, 0.0))),
+                    (target, test_display_frame(offset)),
+                ]);
+                let _ = engine.handle_command(
+                    &mut store,
+                    Some(source),
+                    &[source, target],
+                    &centers,
+                    LayoutCommand::MoveNode(direction),
+                );
+                let (source_ws, source_layout) =
+                    engine.workspaces.active_layout_for_space(source).unwrap();
+                let (target_ws, target_layout) =
+                    engine.workspaces.active_layout_for_space(target).unwrap();
+                assert!(
+                    !engine.workspaces[source_ws]
+                        .layout_system
+                        .contains_window(source_layout, moving),
+                    "{direction:?}, stacked={stacked}"
+                );
+                assert!(
+                    engine.workspaces[target_ws]
+                        .layout_system
+                        .contains_window(target_layout, moving)
+                );
+                let gaps = engine.layout_settings.gaps.clone();
+                let frames: HashMap<_, _> = engine
+                    .calculate_layout(
+                        target,
+                        CGRect::new(CGPoint::new(0.0, 0.0), size),
+                        &gaps,
+                        0.0,
+                        Default::default(),
+                        Default::default(),
+                    )
+                    .into_iter()
+                    .collect();
+                for other in [3, 4, 5].map(|idx| WindowId::new(1, idx)) {
+                    let a = frames[&moving];
+                    let b = frames[&other];
+                    assert!(
+                        match direction {
+                            Direction::Right => a.max().x <= b.min().x,
+                            Direction::Left => a.min().x >= b.max().x,
+                            Direction::Down => a.max().y <= b.min().y,
+                            Direction::Up => a.min().y >= b.max().y,
+                        },
+                        "{direction:?}, stacked={stacked}: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3660,12 +3851,20 @@ mod tests {
             None
         );
 
+        for (space, direction) in [(left, Direction::Left), (right, Direction::Right)] {
+            assert_eq!(
+                engine.next_space_for_direction(space, direction, &visible_spaces, &centers),
+                None,
+                "directional navigation must stop at the display edge"
+            );
+        }
+
         let upper = SpaceId::new(4);
         let lower = SpaceId::new(5);
         let mut vertical_centers = HashMap::default();
-        vertical_centers.insert(upper, CGPoint::new(960.0, -1080.0));
-        vertical_centers.insert(middle, CGPoint::new(960.0, 0.0));
-        vertical_centers.insert(lower, CGPoint::new(960.0, 1080.0));
+        vertical_centers.insert(upper, test_display_frame(CGPoint::new(960.0, -1080.0)));
+        vertical_centers.insert(middle, test_display_frame(CGPoint::new(960.0, 0.0)));
+        vertical_centers.insert(lower, test_display_frame(CGPoint::new(960.0, 1080.0)));
         let vertical_spaces = vec![lower, middle, upper];
         assert_eq!(
             engine.next_space_for_direction(
@@ -3688,19 +3887,64 @@ mod tests {
     }
 
     #[test]
+    fn directional_display_choice_uses_bounds_and_perpendicular_alignment() {
+        let engine = test_engine();
+        let source = SpaceId::new(1);
+        let diagonal = SpaceId::new(2);
+        let aligned = SpaceId::new(3);
+        let above = SpaceId::new(4);
+        let frames = HashMap::from_iter([
+            (
+                source,
+                CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 1000.0)),
+            ),
+            (
+                diagonal,
+                CGRect::new(CGPoint::new(1000.0, 1500.0), CGSize::new(500.0, 500.0)),
+            ),
+            (
+                aligned,
+                CGRect::new(CGPoint::new(2000.0, 0.0), CGSize::new(1000.0, 1000.0)),
+            ),
+            // Its centre is to the right, but the display is above the source.
+            (
+                above,
+                CGRect::new(CGPoint::new(0.0, -1000.0), CGSize::new(2000.0, 1000.0)),
+            ),
+        ]);
+        assert_eq!(
+            engine.next_space_for_direction(
+                source,
+                Direction::Right,
+                &[source, diagonal, aligned],
+                &frames
+            ),
+            Some(aligned)
+        );
+        assert_eq!(
+            engine.next_space_for_direction(source, Direction::Right, &[source, above], &frames),
+            None
+        );
+        assert_eq!(
+            engine.next_space_for_direction(source, Direction::Up, &[source, above], &frames),
+            Some(above)
+        );
+    }
+
+    #[test]
     fn handle_command_does_not_panic_before_layout_initialization() {
         let mut window_store = WindowStore::default();
         let mut engine = test_engine();
         let space = SpaceId::new(42);
         let visible_spaces = vec![space];
-        let visible_space_centers = HashMap::default();
+        let visible_space_frames = HashMap::default();
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             engine.handle_command(
                 &mut window_store,
                 Some(space),
                 &visible_spaces,
-                &visible_space_centers,
+                &visible_space_frames,
                 LayoutCommand::NextWindow,
             )
         }));
@@ -3927,7 +4171,7 @@ mod tests {
         let space_b = SpaceId::new(202);
         let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 800.0));
         let visible_spaces = vec![space_a, space_b];
-        let visible_space_centers = HashMap::default();
+        let visible_space_frames = HashMap::default();
         let window_a = WindowId::new(1, 1);
         let window_b = WindowId::new(1, 2);
         let window_c = WindowId::new(2, 1);
@@ -3950,7 +4194,7 @@ mod tests {
             &mut window_store,
             Some(space_a),
             &visible_spaces,
-            &visible_space_centers,
+            &visible_space_frames,
             LayoutCommand::ResizeWindowBy { amount: 0.2 },
         );
 
@@ -4150,9 +4394,9 @@ mod tests {
         let adjacent_space = SpaceId::new(51);
         let screen_size = CGSize::new(1920.0, 1080.0);
         let visible_spaces = vec![current_space, adjacent_space];
-        let mut visible_space_centers = HashMap::default();
-        visible_space_centers.insert(current_space, CGPoint::new(0.0, 0.0));
-        visible_space_centers.insert(adjacent_space, CGPoint::new(1920.0, 0.0));
+        let mut visible_space_frames = HashMap::default();
+        visible_space_frames.insert(current_space, test_display_frame(CGPoint::new(0.0, 0.0)));
+        visible_space_frames.insert(adjacent_space, test_display_frame(CGPoint::new(1920.0, 0.0)));
 
         let _ = engine.handle_event(
             &mut window_store,
@@ -4164,7 +4408,7 @@ mod tests {
                 &mut window_store,
                 Some(current_space),
                 &visible_spaces,
-                &visible_space_centers,
+                &visible_space_frames,
                 LayoutCommand::MoveFocus(Direction::Right),
             )
         }));
@@ -4173,6 +4417,44 @@ mod tests {
             result.is_ok(),
             "cross-space move focus should not panic when adjacent space is not initialized"
         );
+    }
+
+    #[test]
+    fn scrolling_repeated_native_focus_does_not_rearrange_the_strip() {
+        let mut settings = LayoutSettings::default();
+        settings.mode = LayoutMode::Scrolling;
+        let mut engine = LayoutEngine::new(&VirtualWorkspaceSettings::default(), &settings, None);
+        let mut store = WindowStore::default();
+        let space = SpaceId::new(99);
+        let _ = engine.handle_event(
+            &mut store,
+            LayoutEvent::SpaceExposed(space, CGSize::new(1000., 800.)),
+        );
+        let windows = [
+            WindowId::new(99, 1),
+            WindowId::new(99, 2),
+            WindowId::new(99, 3),
+        ];
+        for window in windows {
+            let _ = engine.handle_event(&mut store, LayoutEvent::WindowAdded(space, window));
+        }
+        // A click can change selection and reveal a different column. Subsequent
+        // mouse releases on that same window must not request another arrange.
+        let selected = engine.focused_window();
+        let window = windows.into_iter().find(|window| Some(*window) != selected).unwrap();
+        assert!(
+            engine
+                .handle_event(&mut store, LayoutEvent::WindowFocused(space, window))
+                .changed
+        );
+        for _ in 0..3 {
+            assert!(
+                !engine
+                    .handle_event(&mut store, LayoutEvent::WindowFocused(space, window))
+                    .changed,
+                "unchanged native focus must not restart camera presentation"
+            );
+        }
     }
 
     #[test]
@@ -4219,15 +4501,15 @@ mod tests {
         );
 
         let visible_spaces = vec![current_space, upper_space];
-        let mut visible_space_centers = HashMap::default();
-        visible_space_centers.insert(current_space, CGPoint::new(960.0, 540.0));
-        visible_space_centers.insert(upper_space, CGPoint::new(960.0, -540.0));
+        let mut visible_space_frames = HashMap::default();
+        visible_space_frames.insert(current_space, test_display_frame(CGPoint::new(960.0, 540.0)));
+        visible_space_frames.insert(upper_space, test_display_frame(CGPoint::new(960.0, -540.0)));
 
         let response = engine.handle_command(
             &mut window_store,
             Some(current_space),
             &visible_spaces,
-            &visible_space_centers,
+            &visible_space_frames,
             LayoutCommand::MoveFocus(Direction::Up),
         );
 
@@ -4264,6 +4546,37 @@ mod tests {
                 .map(|ws| ws.layout_mode()),
             Some(LayoutMode::Scrolling)
         );
+    }
+
+    #[test]
+    fn config_reload_preserves_runtime_workspace_layout() {
+        for rule_layout in [None, Some(LayoutMode::Stack)] {
+            let mut settings = VirtualWorkspaceSettings::default();
+            let mut layouts = LayoutSettings::default();
+            layouts.mode = LayoutMode::Stack;
+            if let Some(layout) = rule_layout {
+                settings.workspace_rules.push(WorkspaceLayoutRule {
+                    workspace: WorkspaceSelector::Index(0),
+                    layout,
+                });
+            }
+            let mut engine = LayoutEngine::new(&settings, &layouts, None);
+            let mut store = WindowStore::default();
+            let space = SpaceId::new(7);
+            engine.workspaces_mut().list_workspaces(space);
+            let _ = engine.handle_virtual_workspace_command(
+                &mut store,
+                space,
+                &LayoutCommand::SetWorkspaceLayout {
+                    workspace: Some(0),
+                    mode: LayoutMode::Floating,
+                },
+            );
+            assert_eq!(engine.active_layout_mode_at(space), LayoutMode::Floating);
+            engine.set_layout_settings(&layouts);
+            engine.update_virtual_workspace_settings(&store, &settings);
+            assert_eq!(engine.active_layout_mode_at(space), LayoutMode::Floating);
+        }
     }
 
     #[test]

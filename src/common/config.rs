@@ -620,6 +620,9 @@ pub enum MouseDropAction {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct DragDropSettings {
+    /// Enable trackpad feedback after a successful window drop.
+    #[serde(default = "yes")]
+    pub haptics_enabled: bool,
     /// Enables native drag targeting and modifier mouse actions.
     #[serde(default = "yes")]
     pub enabled: bool,
@@ -649,6 +652,7 @@ impl Default for DragDropSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            haptics_enabled: true,
             modifier: MouseModifier::Fn,
             action1: MouseAction::Move,
             action2: MouseAction::None,
@@ -942,6 +946,10 @@ pub struct ScrollingLayoutSettings {
     /// Keep a window's existing column width when it enters scrolling layout.
     #[serde(default = "default_true")]
     pub preserve_window_sizes: bool,
+    /// Fill the usable width when a workspace has only one scrolling column.
+    /// The column's stored width is restored when another column is added.
+    #[serde(default)]
+    pub expand_single_column: bool,
     /// Minimum column width ratio allowed by resize commands.
     #[serde(default = "default_scrolling_min_column_width_ratio")]
     pub min_column_width_ratio: f64,
@@ -975,6 +983,7 @@ impl Default for ScrollingLayoutSettings {
             column_width_ratio: default_scrolling_column_width_ratio(),
             preset_column_widths: default_scrolling_preset_column_widths(),
             preserve_window_sizes: true,
+            expand_single_column: false,
             min_column_width_ratio: default_scrolling_min_column_width_ratio(),
             max_column_width_ratio: default_scrolling_max_column_width_ratio(),
             per_display: HashMap::default(),

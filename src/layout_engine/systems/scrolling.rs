@@ -2,9 +2,11 @@
 //! View targets follow niri's fit/center and gesture snap semantics. Ordinary layout
 //! animation remains in the reactor; touchpad release belongs to the camera.
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
@@ -80,16 +82,58 @@ enum Viewport {
     #[default]
     Uninitialized,
     Static(f64),
+    // Keep the previous position until the presenter starts the new target.
+    Pending {
+        from: f64,
+        target: f64,
+    },
     Gesture(f64),
     Animation(CameraSpring),
 }
 
 impl Viewport {
+    // Layout queries use the requested offset; the presenter also needs the
+    // previous offset until it starts the animation.
     fn offset(&self) -> f64 {
         match self {
             Self::Uninitialized => 0.0,
             Self::Static(offset) | Self::Gesture(offset) => *offset,
+            Self::Pending { target, .. } => *target,
             Self::Animation(spring) => spring.current,
+        }
+    }
+
+    fn start_offset(&self) -> f64 {
+        match self {
+            Self::Pending { from, .. } => *from,
+            _ => self.offset(),
+        }
+    }
+
+    fn set_target(&mut self, target: f64) {
+        let from = self.start_offset();
+        *self = if from == target {
+            Self::Static(target)
+        } else {
+            Self::Pending { from, target }
+        };
+    }
+
+    fn sample(&mut self, now: Instant, scale: f64) -> Option<bool> {
+        if let Self::Pending { target, .. } = *self {
+            *self = Self::Static(target);
+            return Some(false);
+        }
+        let Self::Animation(spring) = self else {
+            return None;
+        };
+        // Bounds constrain the destination. After a column closes, the previous
+        // position can lie outside them and must remain visible while returning.
+        if spring.sample(now, scale) {
+            *self = Self::Static(spring.target);
+            Some(false)
+        } else {
+            Some(true)
         }
     }
 
@@ -97,6 +141,10 @@ impl Viewport {
         match self {
             Self::Uninitialized => {}
             Self::Static(offset) | Self::Gesture(offset) => *offset += delta,
+            Self::Pending { from, target } => {
+                *from += delta;
+                *target += delta;
+            }
             Self::Animation(spring) => {
                 spring.from += delta;
                 spring.target += delta;
@@ -108,24 +156,51 @@ impl Viewport {
 
 /// Niri's default horizontal-view-movement: mass 1, critical damping, stiffness 800.
 #[derive(Clone, Debug)]
-struct CameraSpring {
+pub(crate) struct CameraSpring {
     from: f64,
     target: f64,
     velocity: f64,
     current: f64,
+    current_velocity: f64,
     started: Instant,
+    sampled: Instant,
 }
 impl CameraSpring {
-    fn sample(&mut self, now: Instant) -> bool {
+    pub(crate) fn new(from: f64, target: f64, velocity: f64, started: Instant) -> Self {
+        Self {
+            from,
+            target,
+            velocity,
+            current: from,
+            current_velocity: velocity,
+            started,
+            sampled: started,
+        }
+    }
+
+    pub(crate) fn current(&self) -> f64 { self.current }
+
+    pub(crate) fn position_velocity(&self, now: Instant) -> (f64, f64) {
         let t = now.saturating_duration_since(self.started).as_secs_f64();
         let omega = 800.0_f64.sqrt();
         let x0 = self.from - self.target;
         let b = omega * x0 + self.velocity;
         let envelope = (-omega * t).exp();
-        self.current = self.target + envelope * (x0 + b * t);
-        let velocity = envelope * (self.velocity - omega * b * t);
+        (
+            self.target + envelope * (x0 + b * t),
+            envelope * (self.velocity - omega * b * t),
+        )
+    }
+
+    pub(crate) fn sample(&mut self, now: Instant, scale: f64) -> bool {
+        let now = now.max(self.sampled);
+        let (position, velocity) = self.position_velocity(now);
+        self.current = position;
+        self.current_velocity = velocity;
+        self.sampled = now;
         // Check both position and speed so crossing the target cannot finish early.
-        (self.current - self.target).abs() <= 0.0001 && velocity.abs() <= 0.0001
+        (self.current - self.target).abs() <= 0.25 / scale
+            && velocity.abs() / 800.0_f64.sqrt() <= 0.25 / scale
     }
 }
 
@@ -165,6 +240,126 @@ struct Geometry {
     frames: Vec<(WindowId, CGRect)>,
     bounds: (f64, f64),
     snaps: Vec<SnapPoint>,
+}
+
+/// Prepared world frames and temporary camera motion. Built only at semantic
+/// boundaries; sampling does not enter the layout engine.
+#[derive(Debug)]
+pub(crate) struct ViewportPresentation {
+    viewport: Viewport,
+    motion: Arc<Mutex<MotionHistory>>,
+    bounds: (f64, f64),
+    width: f64,
+    tiling: CGRect,
+    screen: CGRect,
+}
+
+/// Rendered scalar state, read only at semantic boundaries. Motion samples stay
+/// shared so release keeps the exact touchpad velocity history without cloning
+/// a camera or copying history on each display refresh.
+#[derive(Clone, Debug)]
+pub(crate) struct PresentedViewport {
+    pub offset: f64,
+    pub velocity: f64,
+    pub target: f64,
+    pub gesturing: bool,
+    pub timestamp: Instant,
+    motion: Arc<Mutex<MotionHistory>>,
+}
+
+impl ViewportPresentation {
+    pub fn offset(&self) -> f64 { self.viewport.start_offset() }
+
+    pub fn gesturing(&self) -> bool { matches!(self.viewport, Viewport::Gesture(_)) }
+
+    pub fn animated(&self) -> bool { matches!(self.viewport, Viewport::Animation(_)) }
+
+    pub fn finish(&mut self) {
+        if !self.gesturing() {
+            self.viewport = Viewport::Static(self.target());
+        }
+    }
+
+    pub fn target(&self) -> f64 {
+        match &self.viewport {
+            Viewport::Animation(s) => s.target,
+            Viewport::Pending { target, .. } => *target,
+            _ => self.offset(),
+        }
+    }
+
+    pub fn retarget(&mut self, from: f64, velocity: f64, now: Instant) {
+        let target = self.target();
+        self.viewport = Viewport::Animation(CameraSpring::new(from, target, velocity, now));
+    }
+
+    pub fn position_velocity(&self, now: Instant) -> (f64, f64) {
+        match &self.viewport {
+            Viewport::Animation(s) => s.position_velocity(s.sampled.max(now)),
+            _ => (self.offset(), 0.0),
+        }
+    }
+
+    pub fn update(&mut self, delta: f64, time: Duration) {
+        if let Viewport::Gesture(offset) = &mut self.viewport {
+            self.motion.lock().update(offset, self.bounds, delta * self.width, time);
+        }
+    }
+
+    pub fn sample(&mut self, now: Instant, scale: f64) -> bool {
+        self.viewport.sample(now, scale).unwrap_or(self.gesturing())
+    }
+
+    pub fn snapshot(&self, now: Instant) -> PresentedViewport {
+        PresentedViewport {
+            offset: self.offset(),
+            velocity: match &self.viewport {
+                Viewport::Animation(s) => s.current_velocity,
+                _ => 0.0,
+            },
+            target: self.target(),
+            gesturing: self.gesturing(),
+            timestamp: now,
+            motion: self.motion.clone(),
+        }
+    }
+
+    pub fn target_frame(&self, frame: CGRect, fixed: bool, scale: f64) -> CGRect {
+        self.frame_at_offset(frame, fixed, scale, self.target())
+    }
+
+    pub fn frame_at_offset(
+        &self,
+        mut frame: CGRect,
+        fixed: bool,
+        scale: f64,
+        offset: f64,
+    ) -> CGRect {
+        if !fixed {
+            frame = translate_frame(frame, offset, self.tiling, self.screen, true);
+        }
+        frame.origin.x = (frame.origin.x * scale).round() / scale;
+        frame.origin.y = (frame.origin.y * scale).round() / scale;
+        frame
+    }
+}
+
+fn translate_frame(
+    mut frame: CGRect,
+    offset: f64,
+    tiling: CGRect,
+    screen: CGRect,
+    park: bool,
+) -> CGRect {
+    frame.origin.x += tiling.origin.x - offset;
+    if park {
+        if frame.max().x <= tiling.origin.x {
+            frame.origin.x = screen.origin.x - frame.size.width;
+        } else if frame.origin.x >= tiling.max().x {
+            frame.origin.x = screen.max().x;
+        }
+    }
+    frame
 }
 
 fn proportional_width(view: f64, gap: f64, ratio: f64) -> f64 {
@@ -220,12 +415,17 @@ impl Geometry {
         };
         let mut x = 0.0;
         for column in &state.columns {
-            let base = column.resolved_width(
-                tiling.size.width,
-                gaps.inner.horizontal,
-                settings,
-                &constraints,
-            );
+            // Expansion is derived geometry; keep the requested width for later.
+            let base = if settings.expand_single_column && state.columns.len() == 1 {
+                tiling.size.width
+            } else {
+                column.resolved_width(
+                    tiling.size.width,
+                    gaps.inner.horizontal,
+                    settings,
+                    &constraints,
+                )
+            };
             let mut min: f64 = 1.0;
             let mut fixed: f64 = 0.0;
             let mut max = f64::INFINITY;
@@ -412,6 +612,27 @@ impl MotionHistory {
             self.samples.pop_front();
         }
         true
+    }
+
+    fn update(
+        &mut self,
+        offset: &mut f64,
+        bounds: (f64, f64),
+        delta: f64,
+        time: Duration,
+    ) -> Option<f64> {
+        if !delta.is_finite() {
+            return None;
+        }
+        let raw = *offset + self.overscroll + delta;
+        let bounded = raw.clamp(bounds.0, bounds.1);
+        let moved = bounded - *offset;
+        if !self.push(moved, time) {
+            return None;
+        }
+        self.overscroll = raw - bounded;
+        *offset = bounded;
+        Some(moved)
     }
 
     fn velocity(&self) -> f64 {
@@ -616,10 +837,6 @@ impl LayoutState {
         if self.geometry.as_ref().is_some_and(|g| g.matches(screen, constraints, gaps)) {
             return;
         }
-        let interrupted = matches!(self.viewport, Viewport::Animation(_));
-        if interrupted {
-            self.viewport = Viewport::Static(self.viewport.offset());
-        }
         let bookmark = self.restored_view.take().or_else(|| self.bookmark());
         let initial = matches!(self.viewport, Viewport::Uninitialized);
         if settings.preserve_window_sizes {
@@ -654,10 +871,7 @@ impl LayoutState {
             let old = self.viewport.offset();
             self.viewport.rebase(column.world_x + bookmark.relative_offset - old);
         }
-        if interrupted && let Viewport::Static(offset) = &mut self.viewport {
-            let g = self.geometry.as_ref().unwrap();
-            *offset = offset.clamp(g.bounds.0, g.bounds.1);
-        }
+        self.reconcile_camera_bounds();
         if initial {
             self.viewport = Viewport::Static(0.0);
             if self.columns.len() == 1 {
@@ -665,6 +879,22 @@ impl LayoutState {
                 self.viewport = Viewport::Static(g.anchor_offset(0, settings.alignment));
             } else {
                 self.reveal(settings);
+            }
+            self.viewport = Viewport::Static(self.viewport.offset());
+        }
+    }
+
+    fn reconcile_camera_bounds(&mut self) {
+        if let (Viewport::Animation(spring), Some(g)) = (&mut self.viewport, &self.geometry) {
+            let target = spring.target.clamp(g.bounds.0, g.bounds.1);
+            if target != spring.target {
+                let now = Instant::now().max(spring.sampled);
+                let (_, velocity) = spring.position_velocity(now);
+                spring.from = spring.current;
+                spring.velocity = velocity;
+                spring.target = target;
+                spring.started = now;
+                spring.sampled = now;
             }
         }
     }
@@ -687,7 +917,7 @@ impl LayoutState {
             && let Some(column) = g.column(bookmark.column)
         {
             let view = g.tiling.size.width;
-            self.viewport = Viewport::Static(fit_offset(
+            self.viewport.set_target(fit_offset(
                 column.world_x + bookmark.relative_offset,
                 view,
                 column,
@@ -706,9 +936,16 @@ impl LayoutState {
         let offset = if settings.focus_navigation_style == ScrollingFocusNavigationStyle::Anchored {
             g.anchor_offset(self.active_column, settings.alignment)
         } else {
-            fit_offset(self.viewport.offset(), g.tiling.size.width, column)
+            let target = match &self.viewport {
+                Viewport::Animation(s) => s.target,
+                _ => self.viewport.offset(),
+            };
+            fit_offset(target, g.tiling.size.width, column)
         };
-        self.viewport = Viewport::Static(offset);
+        if matches!(&self.viewport, Viewport::Animation(s) if s.target == offset) {
+            return;
+        }
+        self.viewport.set_target(offset);
     }
 
     /// All topology/sizing edits use this transaction. With screen_x = world_x -
@@ -719,10 +956,6 @@ impl LayoutState {
         settings: &ScrollingLayoutSettings,
         edit: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let interrupted = matches!(self.viewport, Viewport::Animation(_));
-        if interrupted {
-            self.viewport = Viewport::Static(self.viewport.offset());
-        }
         let window = self.selected();
         let id = self.columns.get(self.active_column).map(|c| c.id);
         let old_x = id.and_then(|id| self.geometry.as_ref()?.column(id)).map(|c| c.world_x);
@@ -745,11 +978,7 @@ impl LayoutState {
                 self.viewport.rebase(new.world_x - old_x);
             }
         }
-        if interrupted
-            && let (Viewport::Static(offset), Some(g)) = (&mut self.viewport, &self.geometry)
-        {
-            *offset = offset.clamp(g.bounds.0, g.bounds.1);
-        }
+        self.reconcile_camera_bounds();
         if self.columns.is_empty() {
             self.viewport = Viewport::Static(0.0);
         }
@@ -959,14 +1188,7 @@ impl ScrollingLayoutSystem {
     ) -> impl Iterator<Item = (WindowId, CGRect)> + 'a {
         let offset = state.viewport.offset();
         g.frames.iter().map(move |&(wid, mut frame)| {
-            frame.origin.x += g.tiling.origin.x - offset;
-            if park {
-                if frame.max().x <= g.tiling.origin.x {
-                    frame.origin.x = g.screen.origin.x - frame.size.width;
-                } else if frame.origin.x >= g.tiling.max().x {
-                    frame.origin.x = g.screen.max().x;
-                }
-            }
+            frame = translate_frame(frame, offset, g.tiling, g.screen, park);
             frame = frame.round();
             if state.fullscreen.contains(&wid) {
                 frame = g.screen;
@@ -977,16 +1199,49 @@ impl ScrollingLayoutSystem {
         })
     }
 
-    /// Cached-geometry fast path; no constraint solving or topology rebuilding.
-    pub fn viewport_frames(
+    pub(crate) fn presentation(
         &self,
         layout: LayoutId,
-    ) -> impl Iterator<Item = (WindowId, CGRect)> + '_ {
-        self.layouts
-            .get(layout)
-            .into_iter()
-            .filter_map(|state| Some((state, state.geometry.as_ref()?)))
-            .flat_map(|(state, geometry)| Self::translate_frames(state, geometry, true))
+    ) -> Option<(ViewportPresentation, Vec<(WindowId, CGRect, bool)>)> {
+        let state = self.layouts.get(layout)?;
+        let g = state.geometry.as_ref()?;
+        let mut motion = state.motion.clone();
+        motion.samples.reserve(64_usize.saturating_sub(motion.samples.len()));
+        let camera = ViewportPresentation {
+            viewport: state.viewport.clone(),
+            motion: Arc::new(Mutex::new(motion)),
+            bounds: g.bounds,
+            width: g.tiling.size.width,
+            tiling: g.tiling,
+            screen: g.screen,
+        };
+        let frames = g
+            .frames
+            .iter()
+            .map(|&(wid, frame)| {
+                if state.fullscreen.contains(&wid) {
+                    (wid, g.screen, true)
+                } else if state.fullscreen_within_gaps.contains(&wid) {
+                    (wid, g.tiling, true)
+                } else {
+                    (wid, frame.round(), false)
+                }
+            })
+            .collect();
+        Some((camera, frames))
+    }
+
+    pub(crate) fn commit_presented_viewport(&mut self, layout: LayoutId, p: &PresentedViewport) {
+        if let Some(state) = self.layouts.get_mut(layout) {
+            state.viewport = if p.gesturing {
+                Viewport::Gesture(p.offset)
+            } else if p.offset != p.target {
+                Viewport::Animation(CameraSpring::new(p.offset, p.target, p.velocity, p.timestamp))
+            } else {
+                Viewport::Static(p.offset)
+            };
+            state.motion = p.motion.lock().clone();
+        }
     }
 
     /// Legacy normalized strip delta; boundary recognition is owned by the caller.
@@ -999,7 +1254,7 @@ impl ScrollingLayoutSystem {
         let column = g.columns.get(state.active_column)?;
         let step = column.width + g.gaps.inner.horizontal;
         let raw = state.viewport.offset() + delta * step;
-        state.viewport = Viewport::Static(raw.clamp(g.bounds.0, g.bounds.1));
+        state.viewport.set_target(raw.clamp(g.bounds.0, g.bounds.1));
         if raw < g.bounds.0 {
             Some((Direction::Left, (g.bounds.0 - raw) / step))
         } else if raw > g.bounds.1 {
@@ -1030,7 +1285,7 @@ impl ScrollingLayoutSystem {
         state.motion.overscroll = 0.0;
         state.motion.samples.clear();
         state.motion.samples.reserve(64);
-        Self::advance_camera(state, now);
+        state.viewport.sample(now, 1.0);
         state.viewport = Viewport::Gesture(state.viewport.offset());
         true
     }
@@ -1050,16 +1305,7 @@ impl ScrollingLayoutSystem {
             return None;
         };
         let g = state.geometry.as_ref()?;
-        // Hidden edge travel unwinds before the camera moves back into bounds.
-        let raw = *offset + state.motion.overscroll + delta;
-        let bounded = raw.clamp(g.bounds.0, g.bounds.1);
-        let moved = bounded - *offset;
-        if !state.motion.push(moved, timestamp) {
-            return None;
-        }
-        state.motion.overscroll = raw - bounded;
-        *offset = bounded;
-        Some(moved)
+        state.motion.update(offset, g.bounds, delta, timestamp)
     }
 
     /// Normalize only at the layout boundary, using cached working geometry.
@@ -1091,44 +1337,14 @@ impl ScrollingLayoutSystem {
         let projected = offset - velocity / (1000.0 * 0.997_f64.ln());
         let release = self.settle(layout, projected, velocity, true)?;
         if animate {
-            self.layouts[layout].viewport = Viewport::Animation(CameraSpring {
-                from: release.from_offset,
-                target: release.offset,
-                velocity: release.velocity,
-                current: release.from_offset,
-                started: Instant::now(),
-            });
+            self.layouts[layout].viewport = Viewport::Animation(CameraSpring::new(
+                release.from_offset,
+                release.offset,
+                release.velocity,
+                Instant::now(),
+            ));
         }
         Some(release)
-    }
-
-    fn advance_camera(state: &mut LayoutState, now: Instant) -> Option<bool> {
-        let Viewport::Animation(spring) = &mut state.viewport else {
-            return None;
-        };
-        let complete = spring.sample(now);
-        if let Some(g) = &state.geometry {
-            spring.current = spring.current.clamp(g.bounds.0, g.bounds.1);
-        }
-        if complete {
-            state.viewport = Viewport::Static(spring.target);
-            Some(false)
-        } else {
-            Some(true)
-        }
-    }
-
-    pub fn advance_viewport_animation(&mut self, layout: LayoutId, now: Instant) -> Option<bool> {
-        self.layouts.get_mut(layout).and_then(|state| Self::advance_camera(state, now))
-    }
-
-    /// Resolve an abandoned release to its already-selected target.
-    pub fn finish_viewport_animation(&mut self, layout: LayoutId) {
-        if let Some(state) = self.layouts.get_mut(layout)
-            && let Viewport::Animation(spring) = &state.viewport
-        {
-            state.viewport = Viewport::Static(spring.target);
-        }
     }
 
     /// Settle where cancellation occurred, with no artificial fling or focus change.
@@ -1208,7 +1424,7 @@ impl ScrollingLayoutSystem {
         }
         state.active_column = index;
         state.transient_restore = None;
-        state.viewport = Viewport::Static(offset);
+        state.viewport.set_target(offset);
         Some(ViewportRelease {
             window: state.selected()?,
             offset,
@@ -1229,7 +1445,7 @@ impl ScrollingLayoutSystem {
         if let Some(g) = &state.geometry
             && let Some(column) = g.columns.get(state.active_column)
         {
-            state.viewport = Viewport::Static(centered_offset(g.tiling.size.width, *column));
+            state.viewport.set_target(centered_offset(g.tiling.size.width, *column));
         }
     }
 
@@ -1316,7 +1532,7 @@ impl ScrollingLayoutSystem {
             if let Some(column) =
                 state.geometry.as_ref().and_then(|g| g.columns.get(state.active_column))
             {
-                state.viewport = Viewport::Static(column.world_x);
+                state.viewport.set_target(column.world_x);
             }
         }
         vec![wid]
@@ -1330,7 +1546,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
 
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
         let mut state = self.layouts.get(layout).cloned().unwrap_or_default();
-        if matches!(state.viewport, Viewport::Animation(_)) {
+        if let Viewport::Pending { target, .. } = state.viewport {
+            state.viewport = Viewport::Static(target);
+        } else if matches!(state.viewport, Viewport::Animation(_)) {
             let offset = state.viewport.offset();
             state.viewport = Viewport::Static(
                 state.geometry.as_ref().map_or(offset, |g| offset.clamp(g.bounds.0, g.bounds.1)),
@@ -1642,11 +1860,12 @@ impl LayoutSystem for ScrollingLayoutSystem {
             return false;
         };
         state.transient_restore = None;
-        state.mutate(&self.settings, |state| {
+        let horizontal = matches!(direction, Direction::Left | Direction::Right);
+        let viewport = horizontal.then(|| state.viewport.clone());
+        let moved = state.mutate(&self.settings, |state| {
             let Some((col, row)) = state.selected_location() else {
                 return false;
             };
-            let horizontal = matches!(direction, Direction::Left | Direction::Right);
             if horizontal && state.columns[col].windows.len() > 1 {
                 let wid = state.selected().unwrap();
                 let (width, weight) = state.detach(wid).unwrap();
@@ -1680,7 +1899,15 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 column.active_window = target;
             }
             true
-        })
+        });
+        if let Some(viewport) = viewport {
+            state.viewport = viewport;
+            state.reconcile_camera_bounds();
+            if moved {
+                state.reveal(&self.settings);
+            }
+        }
+        moved
     }
 
     fn move_selection_to_layout_after_selection(&mut self, from: LayoutId, to: LayoutId) {
@@ -1882,7 +2109,24 @@ fn set_height_share(column: &mut Column, row: usize, share: f64, scale: f64) {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) fn presented_frames(
+        system: &super::ScrollingLayoutSystem,
+        layout: crate::layout_engine::LayoutId,
+    ) -> std::vec::IntoIter<(crate::actor::app::WindowId, objc2_core_foundation::CGRect)> {
+        system
+            .presentation(layout)
+            .map(|(camera, frames)| {
+                frames
+                    .into_iter()
+                    .map(|(wid, frame, fixed)| {
+                        (wid, camera.frame_at_offset(frame, fixed, 1.0, camera.offset()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+    }
     use super::*;
     use crate::common::config::{ScrollingWidthOverride, StackDefaultOrientation};
 
@@ -2091,6 +2335,64 @@ mod tests {
     }
 
     #[test]
+    fn single_column_expansion_restores_width_across_topology_and_settings_changes() {
+        let mut f = Fixture::new(1);
+        f.gaps.outer.left = 20.0;
+        f.gaps.outer.right = 30.0;
+        let mut settings = f.system.settings.clone();
+        settings.expand_single_column = true;
+        f.system.update_settings(&settings);
+        assert_eq!(f.frame(1).size.width, 950.0);
+        assert_eq!(f.frame(1).origin.x, 20.0);
+
+        // A preset chosen while expanded survives the temporary geometry override.
+        assert!(f.system.switch_preset_column_width(f.layout, false));
+        assert_eq!(f.frame(1).size.width, 950.0);
+        f.system.add_window_after_selection(f.layout, wid(2));
+        assert_eq!(f.frame(1).size.width, 317.0);
+        assert_eq!(f.frame(2).size.width, 475.0);
+
+        // Multiple windows in one column still expand, retaining vertical layout.
+        f.drop(2, 1, WindowDropAction::Stack);
+        assert_eq!(f.frame(1).size, CGSize::new(950.0, 400.0));
+        assert_eq!(f.frame(2).size, CGSize::new(950.0, 400.0));
+        f.system.remove_window(wid(2));
+        assert_eq!(f.frame(1).size, CGSize::new(950.0, 800.0));
+
+        settings.expand_single_column = false;
+        f.system.update_settings(&settings);
+        assert_eq!(f.frame(1).size.width, 317.0);
+    }
+
+    #[test]
+    fn single_column_expansion_respects_window_width_constraints() {
+        for (constraints, width) in [
+            (
+                WindowLayoutConstraints {
+                    is_resizable: true,
+                    max_width: 600.0,
+                    ..Default::default()
+                },
+                600.0,
+            ),
+            (
+                WindowLayoutConstraints {
+                    locked_width: 350.0,
+                    ..Default::default()
+                },
+                350.0,
+            ),
+        ] {
+            let mut f = Fixture::new(1);
+            let mut settings = f.system.settings.clone();
+            settings.expand_single_column = true;
+            f.system.update_settings(&settings);
+            f.constraints.insert(wid(1), constraints);
+            assert_eq!(f.frame(1).size.width, width);
+        }
+    }
+
+    #[test]
     fn half_width_single_column_and_visible_focus_do_not_expand_or_shift() {
         let mut f = Fixture::new(1);
         assert_eq!(f.frame(1).size.width, 500.0);
@@ -2156,15 +2458,28 @@ mod tests {
     }
 
     #[test]
-    fn reorder_insert_remove_and_preceding_resize_rebase_the_active_column() {
+    fn horizontal_reorder_preserves_camera_and_vertical_reorder_preserves_stack() {
+        let mut f = Fixture::new(3);
+        f.select(2);
+        f.frames();
+        let offset = f.system.layouts[f.layout].viewport.start_offset();
+        assert!(f.system.move_selection(f.layout, Direction::Right));
+        assert_eq!(f.system.window_slot(f.layout, wid(2)), Some(vec![2, 0]));
+        assert_eq!(f.system.window_slot(f.layout, wid(3)), Some(vec![1, 0]));
+        assert_eq!(f.system.layouts[f.layout].viewport.start_offset(), offset);
+        f.drop(2, 3, WindowDropAction::Stack);
+        let before = f.frame(2);
+        assert!(f.system.move_selection(f.layout, Direction::Up));
+        assert_eq!(f.system.window_slot(f.layout, wid(2)), Some(vec![1, 0]));
+        assert_eq!(f.frame(2).size, before.size);
+        assert_eq!(f.selected(), Some(wid(2)));
+    }
+
+    #[test]
+    fn insert_remove_and_preceding_resize_rebase_the_active_column() {
         let mut f = Fixture::new(4);
         f.select(3);
         let x = f.frame(3).origin.x;
-        for direction in [Direction::Left, Direction::Right] {
-            assert!(f.system.move_selection(f.layout, direction));
-            assert_eq!(f.frame(3).origin.x, x);
-            assert_eq!(f.selected(), Some(wid(3)));
-        }
         // Move an inactive window before the active one via the shared drop path.
         f.drop(4, 1, WindowDropAction::Insert(Direction::Left));
         assert_eq!(f.frame(3).origin.x, x);
@@ -2217,10 +2532,10 @@ mod tests {
                 destination_id
             );
             f.system.resize_selection_by(f.layout, 0.2, ResizeOrientation::Vertical);
-            let x = f.frame(2).origin.x;
+            let offset = f.system.layouts[f.layout].viewport.start_offset();
             f.system.consume_or_expel_selection(f.layout, direction);
             assert_eq!(f.selected(), Some(wid(2)));
-            assert_eq!(f.frame(2).origin.x, x);
+            assert_eq!(f.system.layouts[f.layout].viewport.start_offset(), offset);
             assert_eq!(f.frame(2).size.width, 400.0);
             let tree = f.system.container_tree(f.layout);
             let expelled = tree
@@ -2470,7 +2785,10 @@ mod tests {
             let layout = system.create_layout();
             system.add_window_after_selection(layout, wid(1));
             system.prepare_layout(layout, f.screen, &f.constraints, &f.gaps);
-            assert_eq!(system.viewport_frames(layout).next().unwrap().1.origin.x, single);
+            assert_eq!(
+                presented_frames(&system, layout).next().unwrap().1.origin.x,
+                single
+            );
         }
     }
 
@@ -2670,7 +2988,7 @@ mod tests {
         f.drop(5, 4, WindowDropAction::Stack);
         f.select(1);
         let logical = f.frames();
-        let native: Vec<_> = f.system.viewport_frames(f.layout).collect();
+        let native: Vec<_> = presented_frames(&f.system, f.layout).collect();
         for index in 0..3 {
             assert!((logical[index + 1].1.origin.x - logical[index].1.max().x - 17.0).abs() <= 1.0);
         }
@@ -2678,7 +2996,7 @@ mod tests {
         assert!((logical[4].1.origin.y - logical[3].1.max().y - 11.0).abs() <= 1.0);
         assert_eq!(native[3].1.origin.x, f.screen.max().x);
         assert!(logical[3].1.origin.x > native[3].1.origin.x);
-        assert_eq!(f.system.viewport_frames(f.layout).collect::<Vec<_>>(), native);
+        assert_eq!(presented_frames(&f.system, f.layout).collect::<Vec<_>>(), native);
     }
 
     #[test]
@@ -2735,13 +3053,13 @@ mod tests {
         let frames = f.frames();
         let clone = f.system.clone_layout(f.layout);
         assert_eq!(f.system.container_tree(clone), tree);
-        assert_eq!(f.system.viewport_frames(clone).collect::<Vec<_>>(), frames);
+        assert_eq!(presented_frames(&f.system, clone).collect::<Vec<_>>(), frames);
         let text = ron::to_string(&f.system).unwrap();
         let mut restored: ScrollingLayoutSystem = ron::from_str(&text).unwrap();
         restored.update_settings(&f.system.settings);
         restored.prepare_layout(f.layout, f.screen, &f.constraints, &f.gaps);
         assert_eq!(restored.container_tree(f.layout), tree);
-        assert_eq!(restored.viewport_frames(f.layout).collect::<Vec<_>>(), frames);
+        assert_eq!(presented_frames(&restored, f.layout).collect::<Vec<_>>(), frames);
         f.system.select_window(clone, wid(3));
         f.system.center_selected_column(clone);
         let old_x = f
@@ -2794,7 +3112,7 @@ mod tests {
                 f.system.remove_window(wid(index));
             }
             assert_eq!(f.selected(), None);
-            assert!(f.system.viewport_frames(f.layout).next().is_none());
+            assert!(presented_frames(&f.system, f.layout).next().is_none());
             assert!(!f.system.begin_viewport_gesture(f.layout, Instant::now()));
         }
     }
@@ -2813,7 +3131,7 @@ mod tests {
         assert_eq!(system.selected_window(layout), Some(wid(2)));
         assert_eq!(system.container_tree(layout).children[0].node_id, 42);
         assert_eq!(
-            system.viewport_frames(layout).next().unwrap().1.size.width,
+            presented_frames(&system, layout).next().unwrap().1.size.width,
             600.0
         );
         system.add_window_after_selection(layout, wid(3));
@@ -2970,10 +3288,8 @@ mod tests {
             assert_eq!(release.offset, 1500.0);
             if !animate {
                 assert_eq!(f.system.layouts[f.layout].viewport.offset(), 1500.0);
-                assert_eq!(
-                    f.system.advance_viewport_animation(f.layout, Instant::now()),
-                    None
-                );
+                let (mut p, _) = f.system.presentation(f.layout).unwrap();
+                assert!(!p.sample(Instant::now(), 1.0));
                 continue;
             }
             assert_eq!(
@@ -2984,14 +3300,11 @@ mod tests {
                 panic!("release spring")
             };
             let started = spring.started;
+            let (mut p, _) = f.system.presentation(f.layout).unwrap();
             let mut previous = from + direction * 300.0;
             for ms in [1, 10, 40, 80] {
-                assert_eq!(
-                    f.system
-                        .advance_viewport_animation(f.layout, started + Duration::from_millis(ms)),
-                    Some(true)
-                );
-                let current = f.system.layouts[f.layout].viewport.offset();
+                assert!(p.sample(started + Duration::from_millis(ms), 1.0));
+                let current = p.offset();
                 assert!(
                     (current - previous) * direction > 0.0
                         && (release.offset - current) * direction > 0.0
@@ -3002,6 +3315,7 @@ mod tests {
                 previous = current;
             }
             let now = started + Duration::from_millis(80);
+            f.system.commit_presented_viewport(f.layout, &p.snapshot(now));
             f.system.begin_viewport_gesture(f.layout, now);
             assert_eq!(f.system.layouts[f.layout].viewport.offset(), previous);
             f.system.update_viewport_gesture(
@@ -3018,11 +3332,9 @@ mod tests {
                 .end_viewport_gesture(f.layout, Duration::from_millis(310), true)
                 .unwrap();
             assert_eq!(second.from_offset, previous + direction * 20.0);
-            assert_eq!(
-                f.system
-                    .advance_viewport_animation(f.layout, Instant::now() + Duration::from_secs(2)),
-                Some(false)
-            );
+            let (mut p, _) = f.system.presentation(f.layout).unwrap();
+            assert!(!p.sample(Instant::now() + Duration::from_secs(2), 1.0));
+            f.system.commit_presented_viewport(f.layout, &p.snapshot(Instant::now()));
             assert!(
                 matches!(f.system.layouts[f.layout].viewport, Viewport::Static(x) if x == second.offset)
             );
@@ -3030,8 +3342,175 @@ mod tests {
     }
 
     #[test]
-    fn structural_and_environmental_changes_cancel_release_without_stale_frames() {
-        for edit in [0, 1, 2] {
+    fn queued_focus_targets_preserve_the_start_across_column_removal() {
+        let mut f = Fixture::new(4);
+        f.system.select_window(f.layout, wid(3));
+        f.system.select_window(f.layout, wid(4));
+        let (p, _) = f.system.presentation(f.layout).unwrap();
+        assert_eq!((p.offset(), p.target()), (0.0, 1000.0));
+        let snapshot = p.snapshot(Instant::now());
+        assert_eq!((snapshot.offset, snapshot.target), (0.0, 1000.0));
+
+        // Removing an earlier column moves both positions by its width.
+        f.system.remove_window(wid(1));
+        let frames = f.frames();
+        assert_eq!(
+            frames.iter().find(|(id, _)| *id == wid(4)).unwrap().1.origin.x,
+            500.0
+        );
+        let (mut p, _) = f.system.presentation(f.layout).unwrap();
+        assert_eq!((p.offset(), p.target()), (-500.0, 500.0));
+
+        // Animation disabled and layout cloning both keep the requested layout.
+        let clone = f.system.clone_layout(f.layout);
+        let (cloned, _) = f.system.presentation(clone).unwrap();
+        assert_eq!((cloned.offset(), cloned.target()), (500.0, 500.0));
+        p.finish();
+        f.system.commit_presented_viewport(f.layout, &p.snapshot(Instant::now()));
+        assert_eq!((p.offset(), p.target()), (500.0, 500.0));
+        assert_eq!(f.frames(), frames);
+    }
+
+    #[test]
+    fn focus_during_camera_motion_uses_the_semantic_target() {
+        let mut f = Fixture::new(4);
+        let state = &mut f.system.layouts[f.layout];
+        state.activate(wid(3));
+        state.viewport = Viewport::Animation(CameraSpring::new(0.0, 500.0, 0.0, Instant::now()));
+        f.system.select_window(f.layout, wid(2));
+        let state = &f.system.layouts[f.layout];
+        assert_eq!(state.selected(), Some(wid(2)));
+        assert!(matches!(&state.viewport, Viewport::Animation(s) if s.target == 500.0));
+        let (mut p, _) = f.system.presentation(f.layout).unwrap();
+        p.finish();
+        f.system.commit_presented_viewport(f.layout, &p.snapshot(Instant::now()));
+        assert_eq!(f.system.layouts[f.layout].viewport.offset(), 500.0);
+    }
+
+    #[test]
+    fn camera_retarget_and_rebase_preserve_position_and_velocity() {
+        let f = Fixture::new(4);
+        let (mut p, frames) = f.system.presentation(f.layout).unwrap();
+        let start = Instant::now();
+        p.viewport = Viewport::Static(800.0);
+        p.retarget(100.0, 150.0, start);
+        let now = start + Duration::from_millis(30);
+        p.sample(now, 1.0);
+        let (position, velocity) = p.position_velocity(now);
+        assert!(velocity > 0.0);
+        p.viewport = Viewport::Static(900.0);
+        p.retarget(position, velocity, now);
+        let Viewport::Animation(spring) = &p.viewport else {
+            panic!("spring")
+        };
+        let (next_position, next_velocity) = spring.position_velocity(now);
+        assert!((position - next_position).abs() < 1e-9);
+        assert!((velocity - next_velocity).abs() < 1e-9);
+        let (_, world, fixed) = frames[0];
+        let before_rebase = p.frame_at_offset(world, fixed, 2.0, p.offset());
+        p.viewport.rebase(40.0);
+        let mut rebased_world = world;
+        rebased_world.origin.x += 40.0;
+        assert_eq!(
+            p.frame_at_offset(rebased_world, fixed, 2.0, p.offset()),
+            before_rebase
+        );
+        let Viewport::Animation(spring) = &p.viewport else {
+            panic!("spring")
+        };
+        let (rebased_position, rebased_velocity) = spring.position_velocity(now);
+        assert!((rebased_position - position - 40.0).abs() < 1e-9);
+        assert!((rebased_velocity - velocity).abs() < 1e-9);
+        assert!(!p.sample(now + Duration::from_secs(2), 1.0));
+        assert_eq!(p.offset(), 940.0);
+    }
+
+    #[test]
+    fn bounds_retarget_preserves_presented_position_and_velocity() {
+        let mut f = Fixture::new(4);
+        let state = &mut f.system.layouts[f.layout];
+        let start = Instant::now();
+        let mut spring = CameraSpring::new(100.0, 1000.0, 200.0, start);
+        let sampled = start + Duration::from_millis(30);
+        assert!(!spring.sample(sampled, 2.0));
+        let position = spring.current;
+        let (_, velocity) = spring.position_velocity(sampled);
+        state.viewport = Viewport::Animation(spring);
+        state.geometry.as_mut().unwrap().bounds = (0.0, 300.0);
+        state.reconcile_camera_bounds();
+        let Viewport::Animation(spring) = &state.viewport else {
+            panic!("spring");
+        };
+        assert_eq!(spring.target, 300.0);
+        assert_eq!(spring.current, position);
+        assert!((spring.velocity - velocity).abs() < 1e-8);
+        assert_eq!(spring.position_velocity(sampled), (position, velocity));
+    }
+
+    #[test]
+    fn shrinking_bounds_animates_back_from_the_previous_position() {
+        let f = Fixture::new(4);
+        let (mut presentation, _) = f.system.presentation(f.layout).unwrap();
+        let start = Instant::now();
+        presentation.bounds = (0.0, 300.0);
+        presentation.viewport = Viewport::Static(700.0);
+        presentation.retarget(700.0, 0.0, start);
+        // Closing a column leaves the displayed camera outside the new bounds.
+        if let Viewport::Animation(spring) = &mut presentation.viewport {
+            spring.target = 300.0;
+        }
+        assert_eq!(presentation.position_velocity(start).0, 700.0);
+        assert!(presentation.sample(start + Duration::from_millis(16), 2.0));
+        assert!(presentation.offset() > 300.0 && presentation.offset() < 700.0);
+        assert!(!presentation.sample(start + Duration::from_secs(2), 2.0));
+        assert_eq!(presentation.offset(), 300.0);
+    }
+
+    #[test]
+    fn spring_finishes_at_pixel_precision_and_snaps_to_exact_target() {
+        for scale in [1.0, 2.0] {
+            let f = Fixture::new(4);
+            let (mut p, _) = f.system.presentation(f.layout).unwrap();
+            let start = Instant::now();
+            p.viewport = Viewport::Static(700.0);
+            p.retarget(100.0, 250.0, start);
+            let mut finished = None;
+            for tick in 1..120 {
+                let now = start + Duration::from_secs_f64(tick as f64 / 120.0);
+                let (position, velocity) = p.position_velocity(now);
+                if !p.sample(now, scale) {
+                    assert!((position - 700.0).abs() * scale <= 0.25);
+                    assert!(velocity.abs() / 800.0_f64.sqrt() * scale <= 0.25);
+                    assert_eq!(p.offset(), 700.0);
+                    finished = Some(tick);
+                    break;
+                }
+            }
+            assert!(
+                finished.is_some_and(|tick| tick < 60),
+                "no invisible one-second spring tail"
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_presentation_aligns_to_physical_pixels_without_changing_sizes() {
+        let f = Fixture::new(4);
+        let (mut p, frames) = f.system.presentation(f.layout).unwrap();
+        p.viewport = Viewport::Static(0.6);
+        let (_, world, fixed) = frames[0];
+        let retina = p.frame_at_offset(world, fixed, 2.0, p.offset());
+        assert_eq!(retina.origin.x.fract().abs(), 0.5);
+        assert_eq!(retina.size, world.size);
+        assert_eq!(
+            p.frame_at_offset(world, fixed, 1.0, p.offset()).origin.x.fract(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn structural_and_environmental_changes_preserve_release_but_clones_are_static() {
+        for edit in [0, 1, 2, 3, 4] {
             let mut f = Fixture::new(4);
             f.system.begin_viewport_gesture(f.layout, Instant::now());
             f.system.update_viewport_gesture(f.layout, 200.0, Duration::from_millis(10));
@@ -3044,17 +3523,28 @@ mod tests {
                     f.gaps.outer.left = 30.0;
                     f.prepare();
                 }
+                3 => f.system.remove_window(f.system.layouts[f.layout].selected().unwrap()),
+                4 => f.system.add_window_after_selection(f.layout, wid(5)),
                 _ => {
                     f.layout = f.system.clone_layout(f.layout);
                 }
             }
             let frames = f.frames();
-            assert_eq!(
-                f.system
-                    .advance_viewport_animation(f.layout, Instant::now() + Duration::from_secs(1)),
-                None
+            let (mut p, _) = f.system.presentation(f.layout).unwrap();
+            if edit <= 1 {
+                assert!(p.animated(), "non-focus edits preserve release");
+            }
+            if edit == 2 {
+                assert!(!p.animated(), "clones remain static");
+            }
+            assert!(
+                !p.sample(Instant::now() + Duration::from_secs(1), 1.0),
+                "edit {edit} must settle"
             );
-            assert_eq!(f.frames(), frames);
+            f.system.commit_presented_viewport(f.layout, &p.snapshot(Instant::now()));
+            if edit == 2 {
+                assert_eq!(f.frames(), frames);
+            }
             let state = &f.system.layouts[f.layout];
             let g = state.geometry.as_ref().unwrap();
             assert!(
