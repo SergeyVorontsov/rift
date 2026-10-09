@@ -235,6 +235,7 @@ impl Reactor {
     ) {
         self.state.windows.insert_window(wid, super::WindowState {
             info: WindowInfo {
+                has_native_tabs: false,
                 is_standard: true,
                 is_root: true,
                 is_minimized: false,
@@ -335,12 +336,15 @@ pub fn forwarded_space_state(screens: Vec<ScreenInfo>) -> ForwardedSpaceState {
                 .map(move |id| (WindowServerId::new(id), space))
             })
             .collect(),
-        screens,
+        screens: screens.clone(),
         fullscreen_spaces: Default::default(),
         active_spaces,
         menu_bar_space: command_space,
         command_space,
-        display_space_ids: Default::default(),
+        display_space_ids: screens
+            .iter()
+            .filter_map(|screen| Some((screen.display_uuid.clone(), vec![screen.space?])))
+            .collect(),
         last_user_space_by_display: Default::default(),
         space_remaps: Vec::new(),
         display_set_changed: false,
@@ -417,6 +421,7 @@ pub fn make_window_info(
     bundle_id: Option<&str>,
 ) -> WindowInfo {
     WindowInfo {
+        has_native_tabs: false,
         is_standard: true,
         is_root: true,
         is_minimized: false,
